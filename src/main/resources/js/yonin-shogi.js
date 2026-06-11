@@ -378,6 +378,11 @@ async function pollState() {
 
 function applyServerState(data) {
   const prevMoveCount = game.moveHistory.length;
+  // Detect changes against the *previous* state before overwriting it, otherwise
+  // these comparisons would compare the incoming data against itself and never fire.
+  const statusChanged = data.status !== game.status;
+  const didPlayersChange = playersChanged(data.players);
+
   game.players = data.players;
   game.status = data.status;
   game.currentPlayer = data.currentPlayer;
@@ -394,7 +399,7 @@ function applyServerState(data) {
       applyMoveToBoard(m);
     }
     renderAll();
-  } else if (data.status !== game.status || playersChanged(data.players)) {
+  } else if (statusChanged || didPlayersChange) {
     renderAll();
   }
 }

@@ -1,0 +1,17 @@
+# Build output & tooling — never needed in the image build context
+target/
+project/target/
+project/project/
+.bsp/
+.idea/
+.metals/
+.bloop/
+.vscode/
+.git/
+*.log
+*.class
+
+# Docker / fly meta
+Dockerfile
+.dockerignore
+fly.toml
