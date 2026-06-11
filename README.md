@@ -1,5 +1,7 @@
 # Yonin Shogi
 
+https://yonin-shogi.fly.dev/
+
 Standalone four-player [shogi](https://en.wikipedia.org/wiki/Shogi) (将棋) variant on a 9×9 board — play **solo against bots**, work through an **interactive tutorial**, or host an **online room** and share the link with friends.
 
 Extracted from the [shogi-puzzler](https://github.com/tonykoval/shogi-puzzler) project into its own self-contained app.
