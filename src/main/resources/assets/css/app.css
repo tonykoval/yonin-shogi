@@ -1,0 +1,24 @@
+/* Standalone Yonin Shogi — base theme.
+   The parent project supplied body background + a few utility classes via its
+   site-wide stylesheet; this file reproduces only what the Yonin pages use.
+   Board / piece / lobby / tutorial styling lives in yonin-shogi.css. */
+
+html.dark,
+body.wood {
+  min-height: 100vh;
+}
+
+body.wood {
+  background: #2b2620 radial-gradient(ellipse at top, #3a342b 0%, #211d18 70%) no-repeat;
+  background-attachment: fixed;
+  color: #e6e1d8;
+}
+
+/* Muted light text used across the Yonin pages. */
+.text-light-50 {
+  color: rgba(255, 255, 255, 0.55) !important;
+}
+
+a.navbar-brand:hover {
+  color: #fff;
+}
