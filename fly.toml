@@ -1,36 +1,29 @@
-# fly.io configuration for Yonin Shogi.
-# Deploy with:  fly launch --no-deploy   (first time, to create the app)
-#               fly deploy
+# fly.toml app configuration file generated for yonin-shogi on 2026-06-11T13:34:05Z
 #
-# NOTE: online rooms live in-memory inside a single process (see
-# YoninShogiRoutes). There is no shared/sticky state across machines, so for
-# online multiplayer keep this to ONE machine. Solo-vs-bots and the tutorial
-# run entirely client-side and are unaffected.
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+#
 
-app = "yonin-shogi"
-primary_region = "iad"
+app = 'yonin-shogi'
+primary_region = 'iad'
 
 [build]
 
 [env]
-  YONIN_HOST = "0.0.0.0"
-  YONIN_PORT = "8080"
+  YONIN_HOST = '0.0.0.0'
+  YONIN_PORT = '8080'
 
 [http_service]
   internal_port = 8080
   force_https = true
-  # Keep one machine warm so in-memory rooms survive. Set auto_stop_machines to
-  # "stop" + min_machines_running = 0 if you only care about solo/tutorial and
-  # want it to scale to zero.
-  auto_stop_machines = "off"
+  auto_stop_machines = 'off'
   auto_start_machines = true
   min_machines_running = 1
 
   [http_service.concurrency]
-    type = "requests"
-    soft_limit = 200
+    type = 'requests'
     hard_limit = 250
+    soft_limit = 200
 
 [[vm]]
-  size = "shared-cpu-1x"
-  memory = "512mb"
+  size = 'shared-cpu-1x'
+  memory = '512mb'
