@@ -360,11 +360,67 @@ async function startGame() {
   if (!data.success) alert(data.error || 'Cannot start');
 }
 
-async function sendMove(move) {
-  const data = await apiCall('POST', '/move/' + game.roomId, { seat: game.myPlayer, move });
-  if (!data.success) {
+async function sendMove(move, silent) {
+  // The move carries its own player (a human's own seat, or a bot seat the host
+  // is driving), which must match the server's currentPlayer.
+  const data = await apiCall('POST', '/move/' + game.roomId, { seat: move.player, move });
+  if (!data.success && !silent) {
     alert(data.error || 'Invalid move');
   }
+  return data;
+}
+
+// ── Host-authoritative bots in online rooms ───────────────
+// Bot seats are run client-side by exactly one player: the connected human with
+// the lowest seat index. That client computes the bot's move and relays it like
+// any other move; everyone else just sees it arrive via polling.
+async function addBot(seat, level) {
+  const data = await apiCall('POST', '/addbot/' + game.roomId, { seat, level });
+  if (data.success) pollState();
+  else alert(data.error || 'Could not add bot');
+}
+
+async function removeBot(seat) {
+  const data = await apiCall('POST', '/removebot/' + game.roomId, { seat });
+  if (data.success) pollState();
+  else alert(data.error || 'Could not remove bot');
+}
+
+function iAmBotRunner() {
+  if (!game.players || game.myPlayer < 0) return false;
+  const runner = game.players.findIndex(p => p && p.connected && !p.isBot);
+  return runner !== -1 && runner === game.myPlayer;
+}
+
+function scheduleOnlineBotMove() {
+  if (game.botTimer) { clearTimeout(game.botTimer); game.botTimer = null; }
+  if (game.local || game.status !== 'playing' || !game.players) return;
+  const seat = game.currentPlayer;
+  if (!game.players[seat] || !game.players[seat].isBot) return;
+  if (!iAmBotRunner()) return;
+  const atMoveCount = game.moveHistory.length;
+  game.botTimer = setTimeout(() => runOnlineBotMove(seat, atMoveCount), 700);
+}
+
+async function runOnlineBotMove(seat, atMoveCount) {
+  game.botTimer = null;
+  if (game.local || game.status !== 'playing' || !game.players) return;
+  // Bail if the game state moved on while we were waiting.
+  if (game.moveHistory.length !== atMoveCount) return;
+  if (game.currentPlayer !== seat || !game.players[seat] || !game.players[seat].isBot) return;
+  if (!iAmBotRunner()) return;
+
+  const move = chooseBotMove(seat, game.players[seat].botLevel);
+  if (!move) {
+    // Bot has no legal move — tell the server to eliminate this seat.
+    await apiCall('POST', '/eliminate/' + game.roomId, { loser: seat });
+    pollState();
+    return;
+  }
+  await sendMove(move, true);
+  // Fetch the advanced state promptly so a following bot can act without waiting
+  // for the next poll tick.
+  setTimeout(pollState, 250);
 }
 
 async function pollState() {
@@ -402,6 +458,9 @@ function applyServerState(data) {
   } else if (statusChanged || didPlayersChange) {
     renderAll();
   }
+
+  // After any state update, the host may need to play a bot whose turn it is.
+  scheduleOnlineBotMove();
 }
 
 function playersChanged(newPlayers) {
@@ -593,7 +652,7 @@ function runBotMove() {
   const player = game.currentPlayer;
   if (!game.botSeats.includes(player)) return;
 
-  const move = chooseBotMove(player);
+  const move = chooseBotMove(player, game.players[player].botLevel);
   if (!move) {
     // No legal move (rare in shogi) — concede this seat and continue.
     game.players[player].alive = false;
@@ -633,7 +692,17 @@ function computeEnemyAttacks(board, enemies) {
   return map;
 }
 
-function chooseBotMove(player) {
+// Difficulty tuning. `refine` = how many top candidates pay for full check/mate
+// analysis, `window` = score spread of the random pick pool (bigger = looser
+// play), `blunderChance` = probability of an outright random legal move.
+const BOT_LEVELS = {
+  easy:   { refine: 4,  window: 2.5,  blunderChance: 0.30 },
+  medium: { refine: 12, window: 0.6,  blunderChance: 0 },
+  hard:   { refine: 22, window: 0.05, blunderChance: 0 },
+};
+
+function chooseBotMove(player, level) {
+  const cfg = BOT_LEVELS[level] || BOT_LEVELS.medium;
   const enemies = [0, 1, 2, 3].filter(i => i !== player && findPlayer(i).alive);
   const attackMap = computeEnemyAttacks(game.board, enemies);
   const candidates = [];
@@ -664,18 +733,24 @@ function chooseBotMove(player) {
   }
 
   if (candidates.length === 0) return null;
+
+  // Easy bots occasionally just throw away the turn on a random legal move.
+  if (cfg.blunderChance > 0 && prng() < cfg.blunderChance) {
+    return candidates[Math.floor(prng() * candidates.length)].move;
+  }
+
   candidates.sort((a, b) => b.score - a.score);
 
   // Only the most promising candidates pay for full check/checkmate detection.
-  const refine = Math.min(12, candidates.length);
+  const refine = Math.min(cfg.refine, candidates.length);
   for (let i = 0; i < refine; i++) {
     candidates[i].score += threatBonus(player, candidates[i].move, enemies);
   }
   candidates.sort((a, b) => b.score - a.score);
 
-  // Pick among the top few for a little variety.
+  // Pick among the near-best for variety; a wider window means weaker play.
   const topScore = candidates[0].score;
-  const pool = candidates.filter(x => x.score >= topScore - 0.6);
+  const pool = candidates.filter(x => x.score >= topScore - cfg.window);
   const idx = Math.floor(prng() * pool.length);
   return pool[Math.min(idx, pool.length - 1)].move;
 }
@@ -1036,9 +1111,16 @@ function renderLobby() {
   }
 }
 
+function botLabel(level) {
+  const key = 'yonin.' + (level || 'medium');
+  const fallback = level ? level.charAt(0).toUpperCase() + level.slice(1) : 'Medium';
+  return (window.i18n?.['yonin.bot'] || 'Bot') + ' (' + (window.i18n?.[key] || fallback) + ')';
+}
+
 function renderSeats() {
   const el = document.getElementById('ys-seats');
   if (!el || !game.players) return;
+  const t = (k, d) => window.i18n?.[k] || d;
 
   el.innerHTML = '';
   for (let i = 0; i < 4; i++) {
@@ -1046,24 +1128,66 @@ function renderSeats() {
     const card = document.createElement('div');
     card.className = 'ys-seat-card';
     const colorDot = `<span style="display:inline-block;width:16px;height:16px;border-radius:50%;background:${PLAYER_COLORS[i]};vertical-align:middle;margin-right:8px;"></span>`;
+    const header = `<div class="seat-direction">${colorDot}${PLAYER_LABELS[i]}</div>`;
 
-    if (p.connected) {
+    if (p.connected && p.isBot) {
+      card.classList.add('taken', 'bot-seat');
+      card.innerHTML = header + `<div class="mt-1"><i class="bi bi-robot me-1"></i>${botLabel(p.botLevel)}</div>`;
+      const rm = document.createElement('button');
+      rm.className = 'btn btn-sm btn-outline-danger mt-2';
+      rm.innerHTML = `<i class="bi bi-x"></i> ${t('yonin.removeBot', 'Remove')}`;
+      rm.addEventListener('click', (e) => { e.stopPropagation(); removeBot(i); });
+      card.appendChild(rm);
+    } else if (p.connected) {
       card.classList.add('taken');
       if (i === game.myPlayer) card.classList.add('my-seat');
-      card.innerHTML = `<div class="seat-direction">${colorDot}${PLAYER_LABELS[i]}</div><div class="mt-1">${p.name}${i === game.myPlayer ? ' (You)' : ''}</div>`;
+      card.innerHTML = header + `<div class="mt-1">${p.name}${i === game.myPlayer ? ' (You)' : ''}</div>`;
     } else {
-      card.innerHTML = `<div class="seat-direction">${colorDot}${PLAYER_LABELS[i]}</div><div class="mt-1 text-muted">${window.i18n?.['yonin.clickToJoin'] || 'Click to join'}</div>`;
-      card.addEventListener('click', () => joinSeat(i));
+      card.innerHTML = header;
+      // Take this seat yourself (only if you don't already have one).
+      if (game.myPlayer < 0) {
+        const join = document.createElement('button');
+        join.className = 'btn btn-sm btn-outline-warning mt-2 w-100';
+        join.textContent = t('yonin.clickToJoin', 'Click to join');
+        join.addEventListener('click', () => joinSeat(i));
+        card.appendChild(join);
+      } else {
+        const empty = document.createElement('div');
+        empty.className = 'mt-1 text-muted';
+        empty.textContent = t('yonin.empty', 'Empty');
+        card.appendChild(empty);
+      }
+      // ...or fill it with a bot of the chosen strength.
+      const botRow = document.createElement('div');
+      botRow.className = 'd-flex gap-1 mt-2';
+      const sel = document.createElement('select');
+      sel.className = 'form-select form-select-sm bg-dark text-light border-secondary';
+      [['easy', t('yonin.easy', 'Easy')], ['medium', t('yonin.medium', 'Medium')], ['hard', t('yonin.hard', 'Hard')]]
+        .forEach(([v, lbl]) => {
+          const o = document.createElement('option');
+          o.value = v; o.textContent = lbl;
+          if (v === 'medium') o.selected = true;
+          sel.appendChild(o);
+        });
+      const addBtn = document.createElement('button');
+      addBtn.className = 'btn btn-sm btn-outline-info text-nowrap';
+      addBtn.innerHTML = `<i class="bi bi-robot me-1"></i>${t('yonin.addBot', 'Add bot')}`;
+      addBtn.addEventListener('click', () => addBot(i, sel.value));
+      botRow.appendChild(sel);
+      botRow.appendChild(addBtn);
+      card.appendChild(botRow);
     }
     el.appendChild(card);
   }
 
-  // Start button (visible to first connected player when >= 2 players)
+  // Start button: shown to the first connected *human* once >= 2 seats are filled
+  // (bots count toward the total).
   const startBtn = document.getElementById('ys-start-btn');
   if (startBtn) {
-    const connectedCount = game.players.filter(p => p.connected).length;
-    const isFirstPlayer = game.players.findIndex(p => p.connected) === game.myPlayer;
-    startBtn.style.display = (connectedCount >= 2 && isFirstPlayer) ? '' : 'none';
+    const filledCount = game.players.filter(p => p.connected).length;
+    const firstHuman = game.players.findIndex(p => p.connected && !p.isBot);
+    const iAmFirstHuman = firstHuman !== -1 && firstHuman === game.myPlayer;
+    startBtn.style.display = (filledCount >= 2 && iAmFirstHuman) ? '' : 'none';
   }
 }
 
@@ -1085,11 +1209,13 @@ function initLobbyPage() {
   document.getElementById('ys-create-btn')?.addEventListener('click', createRoom);
   document.getElementById('ys-solo-btn')?.addEventListener('click', () => {
     const bots = document.getElementById('ys-bot-count')?.value || '3';
-    window.location.href = '/yonin-shogi/solo?bots=' + bots;
+    const level = document.getElementById('ys-bot-level')?.value || 'medium';
+    window.location.href = '/yonin-shogi/solo?bots=' + bots + '&level=' + level;
   });
 }
 
-function initSoloGame(numBots) {
+function initSoloGame(numBots, level) {
+  const botLevel = BOT_LEVELS[level] ? level : 'medium';
   const totalPlayers = Math.max(2, Math.min(4, (parseInt(numBots) || 3) + 1));
   game.local = true;
   game.roomId = null;
@@ -1109,6 +1235,7 @@ function initSoloGame(numBots) {
         game.players[i].name = window.i18n?.['yonin.you'] || 'You';
       } else {
         game.players[i].name = (window.i18n?.['yonin.bot'] || 'Bot') + ' ' + i;
+        game.players[i].botLevel = botLevel;
         game.botSeats.push(i);
       }
     } else {
@@ -1147,4 +1274,8 @@ function initGamePage(roomId) {
 }
 
 // Expose for HTML
-window.YoninShogi = { initLobbyPage, initGamePage, initSoloGame, createRoom };
+window.YoninShogi = {
+  initLobbyPage, initGamePage, initSoloGame, createRoom,
+  // Test seam — pure internals exposed for unit tests; no effect on the app.
+  _test: { chooseBotMove, iAmBotRunner, setState: (patch) => Object.assign(game, patch) },
+};

@@ -19,8 +19,14 @@ object YoninShogiRoutes extends cask.Routes {
     name: String = "",
     connected: Boolean = false,
     alive: Boolean = true,
+    isBot: Boolean = false,
+    botLevel: String = "",
     hand: mutable.Map[Int, Int] = mutable.Map(0 -> 0, 1 -> 0, 2 -> 0, 3 -> 0)
   )
+
+  private val botLevels = Set("easy", "medium", "hard")
+  private def validLevel(s: String): String = if (botLevels.contains(s)) s else "medium"
+  private def botName(level: String): String = "Bot (" + validLevel(level).capitalize + ")"
 
   case class Room(
     id: String,
@@ -99,10 +105,10 @@ object YoninShogiRoutes extends cask.Routes {
 
   // Single-player game against bots — runs entirely client-side, no room needed.
   @cask.get("/yonin-shogi/solo")
-  def soloPage(request: cask.Request, bots: Int = 3) = {
+  def soloPage(request: cask.Request, bots: Int = 3, level: String = "medium") = {
     implicit val lang: String = getLang(request)
     val clampedBots = math.max(1, math.min(3, bots))
-    htmlResponse(renderGamePage("", soloBots = Some(clampedBots)).render, request)
+    htmlResponse(renderGamePage("", soloBots = Some(clampedBots), soloLevel = validLevel(level)).render, request)
   }
 
   // ── API ─────────────────────────────────────────────────
@@ -134,6 +140,56 @@ object YoninShogiRoutes extends cask.Routes {
           room.players(seat) = PlayerSlot(name = name, connected = true)
         }
         json(ujson.Obj("success" -> true))
+      }
+    }
+  }
+
+  // Add a bot to an empty seat (only while the room is waiting). Bots are run
+  // client-side by the host (lowest-index connected human); the server just
+  // tracks that the seat is occupied by a bot of a given strength.
+  @cask.post("/yonin-shogi/api/addbot/:roomId")
+  def apiAddBot(roomId: String, request: cask.Request) = {
+    val room = rooms.get(roomId)
+    if (room == null) {
+      json(ujson.Obj("success" -> false, "error" -> "Room not found"))
+    } else {
+      val data = ujson.read(request.text())
+      val seat = data("seat").num.toInt
+      val level = validLevel(data.obj.get("level").map(_.str).getOrElse("medium"))
+
+      room.synchronized {
+        if (room.status != "waiting") {
+          json(ujson.Obj("success" -> false, "error" -> "Game already started"))
+        } else if (seat < 0 || seat > 3) {
+          json(ujson.Obj("success" -> false, "error" -> "Invalid seat"))
+        } else if (room.players(seat).connected) {
+          json(ujson.Obj("success" -> false, "error" -> "Seat taken"))
+        } else {
+          room.players(seat) = PlayerSlot(name = botName(level), connected = true, isBot = true, botLevel = level)
+          json(ujson.Obj("success" -> true))
+        }
+      }
+    }
+  }
+
+  // Remove a bot from a seat (only while waiting).
+  @cask.post("/yonin-shogi/api/removebot/:roomId")
+  def apiRemoveBot(roomId: String, request: cask.Request) = {
+    val room = rooms.get(roomId)
+    if (room == null) {
+      json(ujson.Obj("success" -> false, "error" -> "Room not found"))
+    } else {
+      val data = ujson.read(request.text())
+      val seat = data("seat").num.toInt
+      room.synchronized {
+        if (room.status != "waiting") {
+          json(ujson.Obj("success" -> false, "error" -> "Game already started"))
+        } else if (seat >= 0 && seat <= 3 && room.players(seat).isBot) {
+          room.players(seat) = PlayerSlot()
+          json(ujson.Obj("success" -> true))
+        } else {
+          json(ujson.Obj("success" -> false, "error" -> "Not a bot seat"))
+        }
       }
     }
   }
@@ -178,6 +234,8 @@ object YoninShogiRoutes extends cask.Routes {
           "name" -> p.name,
           "connected" -> p.connected,
           "alive" -> p.alive,
+          "isBot" -> p.isBot,
+          "botLevel" -> p.botLevel,
           "hand" -> ujson.Obj("0" -> p.hand(0), "1" -> p.hand(1), "2" -> p.hand(2), "3" -> p.hand(3))
         )
       }.toIndexedSeq: _*)
@@ -295,6 +353,15 @@ object YoninShogiRoutes extends cask.Routes {
                   option(value := "3", selected := "selected")("3")
                 )
               ),
+              div(cls := "mb-3")(
+                label(cls := "form-label small")(I18n.t("yonin.difficulty")),
+                select(id := "ys-bot-level", cls := "form-select bg-dark text-light border-secondary mx-auto",
+                  style := "max-width: 200px;")(
+                  option(value := "easy")(I18n.t("yonin.easy")),
+                  option(value := "medium", selected := "selected")(I18n.t("yonin.medium")),
+                  option(value := "hard")(I18n.t("yonin.hard"))
+                )
+              ),
               button(cls := "btn btn-warning btn-lg", id := "ys-solo-btn")(
                 i(cls := "bi bi-play-circle me-2"),
                 I18n.t("yonin.playSolo")
@@ -340,10 +407,10 @@ object YoninShogiRoutes extends cask.Routes {
     )
   }
 
-  def renderGamePage(roomId: String, soloBots: Option[Int] = None)(implicit lang: String) = {
+  def renderGamePage(roomId: String, soloBots: Option[Int] = None, soloLevel: String = "medium")(implicit lang: String) = {
     val isSolo = soloBots.isDefined
     val initScript = soloBots match {
-      case Some(n) => s"YoninShogi.initSoloGame($n);"
+      case Some(n) => s"YoninShogi.initSoloGame($n, '${validLevel(soloLevel)}');"
       case None    => s"YoninShogi.initGamePage('$roomId');"
     }
     tag("html")(attr("lang") := lang, cls := "dark")(
