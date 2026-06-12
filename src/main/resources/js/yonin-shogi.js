@@ -658,32 +658,108 @@ function runBotMove() {
     scheduleBotMove();
     return;
   }
-  move.cp = botMoveCp(move);  // centipawn eval of the chosen move (for the CP toggle)
   commitMove(move);
 }
 
-// Material-only centipawn eval of a board from `player`'s view: own material
-// minus the strongest opponent's, ×100. Mirrors ShogiEngine.materialCp so solo
-// and online show the same numbers.
-function materialCp(board, player) {
-  const mat = (pl) => {
-    let s = 0;
-    for (let r = 0; r < 9; r++)
-      for (let c = 0; c < 9; c++) {
-        const p = board[r][c];
-        if (p && p.owner === pl) s += PIECE_VALUE[p.type];
-      }
-    return s;
-  };
-  const mine = mat(player);
-  let best = 0;
-  for (let o = 0; o < 4; o++) if (o !== player) best = Math.max(best, mat(o));
-  return Math.round((mine - best) * 100);
+// ── Per-player evaluation vector ──────────────────────────
+// The core of a 4-player eval: one score per seat instead of a single scalar,
+// because a position can be good for one player and bad for another at the same
+// time. Components: material on board + material in hand − a king-safety penalty
+// when in check. Eliminated seats score 0.
+function evalVector(board, alive) {
+  const v = [0, 0, 0, 0];
+  for (let r = 0; r < 9; r++)
+    for (let c = 0; c < 9; c++) {
+      const p = board[r][c];
+      if (p && alive[p.owner]) v[p.owner] += PIECE_VALUE[p.type];
+    }
+  for (let i = 0; i < 4; i++) {
+    if (!alive[i]) { v[i] = 0; continue; }
+    const hand = game.players[i].hand || [];
+    for (let pt = 0; pt <= 3; pt++) v[i] += (hand[pt] || 0) * PIECE_VALUE[pt];
+    if (isInCheck(board, i)) v[i] -= 2; // king safety
+  }
+  return v;
 }
 
-// CP of a bot move: evaluate the position right after the move (pre-elimination).
-function botMoveCp(move) {
-  const b = cloneBoard(game.board);
+// Pure material points (board + hand) for the status readout — no safety term.
+function playerPoints(i) {
+  if (!game.players[i] || !game.players[i].alive) return 0;
+  let s = 0;
+  for (let r = 0; r < 9; r++)
+    for (let c = 0; c < 9; c++) {
+      const p = game.board[r][c];
+      if (p && p.owner === i) s += PIECE_VALUE[p.type];
+    }
+  const hand = game.players[i].hand || [];
+  for (let pt = 0; pt <= 3; pt++) s += (hand[pt] || 0) * PIECE_VALUE[pt];
+  return s;
+}
+
+function ownMaterial(board, player) {
+  let s = 0;
+  for (let r = 0; r < 9; r++)
+    for (let c = 0; c < 9; c++) {
+      const p = board[r][c];
+      if (p && p.owner === player) s += PIECE_VALUE[p.type];
+    }
+  return s;
+}
+
+function ownMobility(board, player) {
+  let n = 0;
+  for (let r = 0; r < 9; r++)
+    for (let c = 0; c < 9; c++) {
+      const p = board[r][c];
+      if (p && p.owner === player) n += getReachable(board, r, c).length;
+    }
+  return n;
+}
+
+// Cheapest enemy attacker of (tr,tc) and whether any own piece defends it.
+function squareAttack(board, alive, tr, tc, player) {
+  let attacked = false, minAtk = Infinity, defended = false;
+  for (let r = 0; r < 9; r++)
+    for (let c = 0; c < 9; c++) {
+      const p = board[r][c];
+      if (!p || !alive[p.owner] || (r === tr && c === tc)) continue;
+      let hit = false;
+      for (const [rr, rc] of getReachable(board, r, c)) { if (rr === tr && rc === tc) { hit = true; break; } }
+      if (!hit) continue;
+      if (p.owner === player) defended = true;
+      else { attacked = true; if (PIECE_VALUE[p.type] < minAtk) minAtk = PIECE_VALUE[p.type]; }
+    }
+  return { attacked, minAtk: minAtk === Infinity ? 0 : minAtk, defended };
+}
+
+// Paranoid term: the most material an opponent can win on `board` via a single
+// capture (net of the cheapest defender). This is the practical core of a 1-ply
+// "assume the others gang up on me" search — it stops the bot hanging pieces.
+function worstCaptureLoss(board, alive, player) {
+  let worst = 0;
+  for (let r = 0; r < 9; r++)
+    for (let c = 0; c < 9; c++) {
+      const p = board[r][c];
+      if (!p || p.owner !== player || p.type === P.KING) continue;
+      const { attacked, minAtk, defended } = squareAttack(board, alive, r, c, player);
+      if (!attacked) continue;
+      const val = PIECE_VALUE[p.type];
+      const loss = defended ? Math.max(0, val - minAtk) : val;
+      if (loss > worst) worst = loss;
+    }
+  return worst;
+}
+
+// Material values indexed by piece type (pawn,silver,gold,rook,king,tokin,+silver,dragon)
+const PIECE_VALUE = [1, 5, 6, 11, 0, 7, 7, 13];
+
+function cloneBoard(b) {
+  return b.map(row => row.map(cell => cell ? { ...cell } : null));
+}
+
+// Apply a move/drop to a *copy* of `board` and return it (with promotion handled).
+function applyToBoard(board, move) {
+  const b = cloneBoard(board);
   if (move.type === 'move') {
     const [fr, fc] = move.from, [tr, tc] = move.to;
     b[tr][tc] = b[fr][fc]; b[fr][fc] = null;
@@ -694,15 +770,11 @@ function botMoveCp(move) {
     const [tr, tc] = move.to;
     b[tr][tc] = { type: move.pieceType, owner: move.player };
   }
-  return materialCp(b, move.player);
+  return b;
 }
 
-// Material values indexed by piece type (pawn,silver,gold,rook,king,tokin,+silver,dragon)
-const PIECE_VALUE = [1, 5, 6, 11, 0, 7, 7, 13];
-
-function cloneBoard(b) {
-  return b.map(row => row.map(cell => cell ? { ...cell } : null));
-}
+// Living-player flags as a plain [bool,bool,bool,bool] array.
+function aliveArray() { return game.players.map(p => !!p.alive); }
 
 function bestPromote(piece, fr, fc, tr, tc) {
   if (!CAN_PROMOTE[piece.type] || isPromoted(piece.type)) return false;
@@ -727,10 +799,12 @@ function computeEnemyAttacks(board, enemies) {
 // Difficulty tuning. `refine` = how many top candidates pay for full check/mate
 // analysis, `window` = score spread of the random pick pool (bigger = looser
 // play), `blunderChance` = probability of an outright random legal move.
+// `paranoid` makes the refined score subtract the opponents' best capture reply
+// (1-ply "assume they gang up on me"); enabled for the stronger levels.
 const BOT_LEVELS = {
-  easy:   { refine: 4,  window: 2.5,  blunderChance: 0.30 },
-  medium: { refine: 12, window: 0.6,  blunderChance: 0 },
-  hard:   { refine: 22, window: 0.05, blunderChance: 0 },
+  easy:   { refine: 4,  window: 2.5,  blunderChance: 0.30, positional: false, paranoid: false },
+  medium: { refine: 14, window: 0.6,  blunderChance: 0,    positional: true,  paranoid: true  },
+  hard:   { refine: 28, window: 0.05, blunderChance: 0,    positional: true,  paranoid: true  },
 };
 
 function chooseBotMove(player, level) {
@@ -748,7 +822,7 @@ function chooseBotMove(player, level) {
       for (const [tr, tc] of moves) {
         const promote = bestPromote(piece, r, c, tr, tc);
         const move = { type: 'move', player, from: [r, c], to: [tr, tc], promote };
-        candidates.push({ move, score: cheapScore(player, move, attackMap) });
+        candidates.push({ move, score: scoreBase(cfg, player, move, attackMap) });
       }
     }
   }
@@ -773,10 +847,18 @@ function chooseBotMove(player, level) {
 
   candidates.sort((a, b) => b.score - a.score);
 
-  // Only the most promising candidates pay for full check/checkmate detection.
+  // Only the most promising candidates pay for full check/checkmate detection
+  // (and, for positional levels, mobility + the paranoid hanging-piece term).
   const refine = Math.min(cfg.refine, candidates.length);
+  const alive = aliveArray();
   for (let i = 0; i < refine; i++) {
-    candidates[i].score += threatBonus(player, candidates[i].move, enemies);
+    const move = candidates[i].move;
+    candidates[i].score += threatBonus(player, move, enemies);
+    if (cfg.positional) {
+      const after = applyToBoard(game.board, move);
+      candidates[i].score += ownMobility(after, player) * 0.03;
+      if (cfg.paranoid) candidates[i].score -= worstCaptureLoss(after, alive, player);
+    }
   }
   candidates.sort((a, b) => b.score - a.score);
 
@@ -793,6 +875,18 @@ function prng() {
   _rngState ^= _rngState << 13; _rngState ^= _rngState >>> 17; _rngState ^= _rngState << 5;
   _rngState >>>= 0;
   return (_rngState % 100000) / 100000;
+}
+
+// Base score for ranking every candidate. Easy keeps the fast ad-hoc heuristic;
+// stronger levels rank by the player's own material on the resulting board (a
+// depth-0 slice of the eval vector), refined later with mobility/threat/paranoid.
+function scoreBase(cfg, player, move, attackMap) {
+  if (!cfg.positional) return cheapScore(player, move, attackMap);
+  let score = ownMaterial(applyToBoard(game.board, move), player) + prng() * 0.3;
+  const [tr, tc] = move.to;
+  score -= (Math.abs(tr - CENTER) + Math.abs(tc - CENTER)) * 0.03; // mild central preference
+  if (move.type === 'drop') score -= 0.25; // prefer developing board pieces over dropping
+  return score;
 }
 
 // Fast heuristic — material, promotion, central control, hanging penalty via attack map.
@@ -818,19 +912,7 @@ function cheapScore(player, move, attackMap) {
 
 // Expensive — only run on the top candidates: rewards checks and checkmates the move delivers.
 function threatBonus(player, move, enemies) {
-  const sim = cloneBoard(game.board);
-  if (move.type === 'move') {
-    const [fr, fc] = move.from, [tr, tc] = move.to;
-    sim[tr][tc] = sim[fr][fc];
-    sim[fr][fc] = null;
-    if (move.promote && CAN_PROMOTE[sim[tr][tc].type] && !isPromoted(sim[tr][tc].type)) {
-      sim[tr][tc] = { ...sim[tr][tc], type: PROMOTE[sim[tr][tc].type] };
-    }
-  } else {
-    const [tr, tc] = move.to;
-    sim[tr][tc] = { type: move.pieceType, owner: player };
-  }
-  return evalThreats(sim, player, enemies);
+  return evalThreats(applyToBoard(game.board, move), player, enemies);
 }
 
 // Reward checks and (especially) checkmates the move delivers.
@@ -935,6 +1017,7 @@ function renderAll() {
   renderBoard();
   renderHands();
   renderPlayerCards();
+  renderAdvantage();
   renderStatus();
   renderMoveLog();
   renderLobby();
@@ -1093,9 +1176,47 @@ function renderPlayerCards() {
     const label = PLAYER_LABELS[i];
     const name = p.name ? escapeHtml(p.name) : (p.connected ? '...' : (window.i18n?.['yonin.empty'] || 'Empty'));
     const me = i === game.myPlayer ? ' (' + (window.i18n?.['yonin.you'] || 'You') + ')' : '';
-    card.innerHTML = `${dot}<strong>${label}</strong>: ${name}${me}`;
+
+    // A king in check is the most actionable info on a 4-player board — always flag it.
+    let badge = '';
+    if (game.status === 'playing' && p.alive && isInCheck(game.board, i)) {
+      badge = ` <span class="ys-check-badge" title="${window.i18n?.['yonin.inCheck'] || 'In check'}">` +
+              `<i class="bi bi-exclamation-triangle-fill"></i></span>`;
+    }
+    // Per-player material points (board + hand): the honest 4-player "eval".
+    let pts = '';
+    if (game.showCp && game.status === 'playing' && p.alive) {
+      pts = ` <span class="ys-points" title="${window.i18n?.['yonin.points'] || 'Material (board + hand)'}">${playerPoints(i)}</span>`;
+    }
+    card.innerHTML = `${dot}<strong>${label}</strong>: ${name}${me}${badge}${pts}`;
     el.appendChild(card);
   }
+}
+
+// 4chess-style stacked "advantage" bar: softmax the per-player point vector into
+// four shares that sum to 100%. It's a heuristic at-a-glance feel, not a
+// calibrated win probability — hence labelled "advantage", not "win %".
+function renderAdvantage() {
+  const el = document.getElementById('ys-advantage');
+  if (!el) return;
+  if (!game.showCp || game.status !== 'playing') { el.style.display = 'none'; el.innerHTML = ''; return; }
+  el.style.display = '';
+
+  const alive = aliveArray();
+  const live = [0, 1, 2, 3].filter(i => alive[i]);
+  const vec = evalVector(game.board, alive); // material + hand − king-safety
+  const T = 6; // softmax temperature — higher = flatter shares
+  const exps = live.map(i => Math.exp(vec[i] / T));
+  const sum = exps.reduce((a, b) => a + b, 0) || 1;
+
+  let html = '';
+  live.forEach((i, k) => {
+    const share = exps[k] / sum * 100;
+    const text = share >= 12 ? Math.round(share) + '%' : '';
+    html += `<div class="ys-adv-seg" style="width:${share}%;background:${PLAYER_COLORS[i]}" ` +
+            `title="${PLAYER_LABELS[i]}: ${Math.round(share)}%">${text}</div>`;
+  });
+  el.innerHTML = html;
 }
 
 function renderStatus() {
@@ -1143,14 +1264,6 @@ function renderMoveLog() {
       text = `${i+1}. ${label}: ${KANJI[m.pieceType]}*${to}`;
     }
     entry.textContent = text;
-    // Show the bot's centipawn evaluation of its own move when the toggle is on.
-    if (game.showCp && typeof m.cp === 'number') {
-      const cp = document.createElement('span');
-      cp.className = 'ys-cp';
-      const sign = m.cp > 0 ? '+' : '';
-      cp.textContent = ` (${sign}${m.cp}cp)`;
-      entry.appendChild(cp);
-    }
     el.appendChild(entry);
   }
   el.scrollTop = el.scrollHeight;
@@ -1365,7 +1478,7 @@ function setupCpToggle() {
   box.addEventListener('change', () => {
     game.showCp = box.checked;
     localStorage.setItem('ys_show_cp', box.checked ? '1' : '0');
-    renderMoveLog();
+    renderAll();
   });
 }
 

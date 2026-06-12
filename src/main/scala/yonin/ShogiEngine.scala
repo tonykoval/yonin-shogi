@@ -324,7 +324,7 @@ object ShogiEngine {
 
   def aliveCount(st: GameState): Int = st.alive.count(identity)
 
-  // ── Evaluation (centipawns) ───────────────────────────────
+  // ── Evaluation ────────────────────────────────────────────
   private def material(b: Board, player: Int): Double = {
     var s = 0.0
     var r = 0
@@ -332,24 +332,66 @@ object ShogiEngine {
     s
   }
 
-  /** Centipawn score of a board from `player`'s view: own material minus the
-   *  strongest opponent's, ×100. Computed on the post-move board (pre-elimination)
-   *  so the client can reproduce the exact same number. */
-  def materialCp(b: Board, alive: Array[Boolean], player: Int): Int = {
-    val mine = material(b, player)
-    var best = 0.0
-    var o = 0
-    while (o < 4) { if (o != player) { val m = material(b, o); if (m > best) best = m }; o += 1 }
-    math.round((mine - best) * 100).toInt
+  // ── Bot ───────────────────────────────────────────────────
+  // `positional` ranks by the player's own material on the resulting board (a
+  // depth-0 slice of the eval vector); `paranoid` subtracts the opponents' best
+  // capture reply (1-ply "assume they gang up on me") so the bot stops hanging.
+  private case class Level(refine: Int, window: Double, blunder: Double, positional: Boolean, paranoid: Boolean)
+  private val LEVELS = Map(
+    "easy"   -> Level(4, 2.5, 0.30, false, false),
+    "medium" -> Level(14, 0.6, 0.0, true, true),
+    "hard"   -> Level(28, 0.05, 0.0, true, true)
+  )
+
+  /** Board resulting from applying a move/drop to a copy of `b` (promotion handled). */
+  private def boardAfter(b: Board, move: Move): Board = {
+    val nb = cloneBoard(b)
+    move match {
+      case BoardMove(_, fr, fc, tr, tc, promote) =>
+        nb(tr)(tc) = nb(fr)(fc); nb(fr)(fc) = null
+        if (promote) { val pt = nb(tr)(tc).ptype; if (CAN_PROMOTE(pt)) nb(tr)(tc).ptype = PROMOTE(pt) }
+      case DropMove(p, pt, tr, tc) => nb(tr)(tc) = new Piece(pt, p)
+    }
+    nb
   }
 
-  // ── Bot ───────────────────────────────────────────────────
-  private case class Level(refine: Int, window: Double, blunder: Double)
-  private val LEVELS = Map(
-    "easy"   -> Level(4, 2.5, 0.30),
-    "medium" -> Level(14, 0.6, 0.0),
-    "hard"   -> Level(28, 0.05, 0.0)
-  )
+  private def ownMobility(b: Board, alive: Array[Boolean], player: Int): Double = {
+    var n = 0.0; var r = 0
+    while (r < 9) { var c = 0; while (c < 9) { val p = b(r)(c); if (p != null && p.owner == player) n += reachable(b, alive, r, c).length; c += 1 }; r += 1 }
+    n
+  }
+
+  // Most material an opponent can win on `b` via a single capture (net of the
+  // cheapest defender) — the practical core of a 1-ply paranoid search.
+  private def worstCaptureLoss(b: Board, alive: Array[Boolean], player: Int): Double = {
+    var worst = 0.0; var r = 0
+    while (r < 9) {
+      var c = 0
+      while (c < 9) {
+        val p = b(r)(c)
+        if (p != null && p.owner == player && p.ptype != KING) {
+          val (att, minAtk, def0) = attackInfo(b, alive, r, c, player)
+          if (att) { val v = PIECE_VALUE(p.ptype); val loss = if (def0) math.max(0.0, v - minAtk) else v; if (loss > worst) worst = loss }
+        }
+        c += 1
+      }
+      r += 1
+    }
+    worst
+  }
+
+  // Positional base score: own material on the resulting board + mild central pull.
+  private def positionalBase(st: GameState, move: Move, rnd: scala.util.Random): Double = {
+    val b = boardAfter(st.board, move)
+    var s = material(b, move.player) + rnd.nextDouble() * 0.3
+    val (tr, tc) = move match { case BoardMove(_, _, _, r, c, _) => (r, c); case DropMove(_, _, r, c) => (r, c) }
+    s -= (math.abs(tr - CENTER) + math.abs(tc - CENTER)) * 0.03
+    if (move.isInstanceOf[DropMove]) s -= 0.25
+    s
+  }
+
+  private def baseScore(cfg: Level, st: GameState, move: Move, rnd: scala.util.Random): Double =
+    if (cfg.positional) positionalBase(st, move, rnd) else staticScore(st, move, rnd)
 
   private def canPromoteHere(piece: Piece, fr: Int, fc: Int, tr: Int, tc: Int): Boolean = {
     if (!CAN_PROMOTE(piece.ptype)) return false
@@ -435,9 +477,9 @@ object ShogiEngine {
       st.board(tr)(tc) = new Piece(pieceType, player); st.hands(player)(pieceType) -= 1
   }
 
-  /** Choose a bot move for `player`. Returns the move plus its centipawn score,
-   *  or None if the seat has no legal move. `seed` varies play between turns. */
-  def chooseBotMove(st: GameState, player: Int, level: String, seed: Int): Option[(Move, Int)] = {
+  /** Choose a bot move for `player`, or None if the seat has no legal move.
+   *  `seed` varies play between turns. */
+  def chooseBotMove(st: GameState, player: Int, level: String, seed: Int): Option[Move] = {
     val cfg = LEVELS.getOrElse(level, LEVELS("medium"))
     val rnd = new scala.util.Random(seed.toLong * 1000003L + player)
     val cands = new ArrayBuffer[(Move, Double)]()
@@ -454,7 +496,7 @@ object ShogiEngine {
             val (tr, tc) = moves(i)
             val promote = canPromoteHere(piece, r, c, tr, tc)
             val m = BoardMove(player, r, c, tr, tc, promote)
-            cands += ((m, staticScore(st, m, rnd)))
+            cands += ((m, baseScore(cfg, st, m, rnd)))
             i += 1
           }
         }
@@ -467,7 +509,7 @@ object ShogiEngine {
       if (st.hands(player)(pt) > 0) {
         val sq = droppableSquares(st.board, st.alive, st.hands, pt, player)
         var i = 0
-        while (i < sq.length) { val (tr, tc) = sq(i); val m = DropMove(player, pt, tr, tc); cands += ((m, staticScore(st, m, rnd))); i += 1 }
+        while (i < sq.length) { val (tr, tc) = sq(i); val m = DropMove(player, pt, tr, tc); cands += ((m, baseScore(cfg, st, m, rnd))); i += 1 }
         pt += 1
       } else pt += 1
     }
@@ -484,7 +526,16 @@ object ShogiEngine {
         var i = 0
         while (i < scored.length) {
           val (m, s) = scored(i)
-          refined += ((m, if (i < refine) s + threatBonus(st, m) else s))
+          var bonus = 0.0
+          if (i < refine) {
+            bonus += threatBonus(st, m)
+            if (cfg.positional) {
+              val after = boardAfter(st.board, m)
+              bonus += ownMobility(after, st.alive, m.player) * 0.03
+              if (cfg.paranoid) bonus -= worstCaptureLoss(after, st.alive, m.player)
+            }
+          }
+          refined += ((m, s + bonus))
           i += 1
         }
         scored = refined.sortBy(-_._2)
@@ -493,10 +544,7 @@ object ShogiEngine {
         pool(rnd.nextInt(pool.length))._1
       }
 
-    // CP of the chosen move: material differential on the resulting board.
-    val sim = cloneState(st)
-    applyMoveNoMate(sim, chosen)
-    Some((chosen, materialCp(sim.board, sim.alive, player)))
+    Some(chosen)
   }
 
   // ── JSON (matches the client move format) ─────────────────
@@ -512,14 +560,13 @@ object ShogiEngine {
     }
   }
 
-  def moveToJson(move: Move, cp: Option[Int], botLevel: Option[String]): ujson.Obj = {
+  def moveToJson(move: Move, botLevel: Option[String]): ujson.Obj = {
     val base: ujson.Obj = move match {
       case BoardMove(p, fr, fc, tr, tc, promote) =>
         ujson.Obj("type" -> "move", "player" -> p, "from" -> ujson.Arr(fr, fc), "to" -> ujson.Arr(tr, tc), "promote" -> promote)
       case DropMove(p, pt, tr, tc) =>
         ujson.Obj("type" -> "drop", "player" -> p, "pieceType" -> pt, "to" -> ujson.Arr(tr, tc))
     }
-    cp.foreach(v => base("cp") = v)
     botLevel.foreach(l => base("bot") = l)
     base
   }

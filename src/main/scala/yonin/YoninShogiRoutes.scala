@@ -113,9 +113,9 @@ object YoninShogiRoutes extends cask.Routes {
       val st = room.engine
       val seat = st.currentPlayer
       ShogiEngine.chooseBotMove(st, seat, room.players(seat).botLevel, room.moves.length) match {
-        case Some((move, cp)) =>
+        case Some(move) =>
           ShogiEngine.applyMove(st, move)
-          room.moves += ShogiEngine.moveToJson(move, Some(cp), Some(room.players(seat).botLevel))
+          room.moves += ShogiEngine.moveToJson(move, Some(room.players(seat).botLevel))
           advanceAfterMove(room)
         case None =>
           // No legal move (rare) — concede this seat and continue.
@@ -526,6 +526,8 @@ object YoninShogiRoutes extends cask.Routes {
                 div(id := "ys-status", cls := "text-center mb-2 fs-5"),
                 // Player cards
                 div(id := "ys-player-cards", cls := "ys-players mb-2"),
+                // Per-player "advantage" bar (toggled with the Eval switch)
+                div(id := "ys-advantage", cls := "ys-adv-bar mb-2", style := "display:none;"),
                 // Board controls
                 div(cls := "text-center mb-2")(
                   button(cls := "btn btn-outline-light btn-sm", id := "ys-rotate-btn",
