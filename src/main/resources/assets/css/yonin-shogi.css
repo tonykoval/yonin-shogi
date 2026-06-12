@@ -145,6 +145,14 @@
   filter: grayscale(.6);
 }
 
+/* Neutral "dead" piece in scatter mode — anyone can capture it. */
+.ys-piece.dead-piece {
+  background: #6c757d;
+  color: #e9ecef;
+  opacity: .8;
+  filter: grayscale(.5);
+}
+
 /* ── Piece rotation (pentagon points toward opponent) ── */
 .ys-piece.facing-0 { transform: rotate(0deg); }      /* South → faces up */
 .ys-piece.facing-1 { transform: rotate(90deg); }      /* West  → faces right */

@@ -320,7 +320,11 @@ let game = {
   botTimer: null,      // pending bot-move timeout
   boardRotation: 0,    // quarter-turns the board view is rotated clockwise (0-3)
   showCp: false,       // show the bot's centipawn evaluation of each move it plays
+  eliminationMode: 'inherit', // what a mate does to the loser's pieces: inherit | hand | scatter
 };
+
+// Accept only known elimination modes; anything else falls back to 'inherit'.
+function validMode(m) { return (m === 'hand' || m === 'scatter') ? m : 'inherit'; }
 
 function findPlayer(id) {
   return game.players ? game.players[id] : { alive: true };
@@ -376,7 +380,8 @@ async function leaveSeat() {
 }
 
 async function startGame() {
-  const data = await apiCall('POST', '/start/' + game.roomId);
+  const mode = document.getElementById('ys-capture-mode')?.value || 'inherit';
+  const data = await apiCall('POST', '/start/' + game.roomId, { mode });
   if (!data.success) alert(data.error || 'Cannot start');
 }
 
@@ -439,6 +444,8 @@ function applyServerState(data) {
   game.status = data.status;
   game.currentPlayer = data.currentPlayer;
   game.winner = data.winner;
+  // Must be set before replaying moves so elimination matches the server's rule.
+  game.eliminationMode = validMode(data.mode);
 
   // Replay moves from server to rebuild board state
   if (data.moves && data.moves.length !== prevMoveCount) {
@@ -518,28 +525,37 @@ function handleCheckmates(mover) {
   }
 }
 
+// What happens to a checkmated player's pieces, by mode:
+//  - 'inherit'  (default): the winner takes control of them on the board, kept
+//               facing the eliminated player's direction (classic yonin rule).
+//  - 'hand':    every piece goes straight into the winner's hand (demoted).
+//  - 'scatter': pieces stay on the board as neutral "dead" pieces that ANY
+//               player can capture; the loser's hand is discarded.
 function eliminatePlayer(loser, winner) {
   game.players[loser].alive = false;
-  // Transfer pieces (except king) to winner
+  const mode = game.eliminationMode || 'inherit';
   for (let r = 0; r < 9; r++) {
     for (let c = 0; c < 9; c++) {
       const p = game.board[r][c];
-      if (p && p.owner === loser) {
-        if (p.type === P.KING) {
-          // Dead king stays as obstacle (mark dead)
-          p.dead = true;
-        } else {
-          // Transfer control to the winner, but the piece keeps moving in the
-          // eliminated player's original direction (yonin rule).
-          if (p.dir == null) p.dir = p.owner;
-          p.owner = winner;
-        }
+      if (!p || p.owner !== loser) continue;
+      if (p.type === P.KING) {
+        p.dead = true; // dead king always stays as an obstacle
+      } else if (mode === 'hand') {
+        game.players[winner].hand[baseType(p.type)]++;
+        game.board[r][c] = null;
+      } else if (mode === 'scatter') {
+        p.dead = true; // neutral piece, capturable by anyone
+      } else {
+        // inherit: keep on board under the winner, preserving original facing.
+        if (p.dir == null) p.dir = p.owner;
+        p.owner = winner;
       }
     }
   }
-  // Transfer hand pieces
+  // Hand pieces: the winner inherits them, except in scatter mode where the
+  // loser's reserves are simply lost.
   for (let pt = 0; pt <= 3; pt++) {
-    game.players[winner].hand[pt] += game.players[loser].hand[pt];
+    if (mode !== 'scatter') game.players[winner].hand[pt] += game.players[loser].hand[pt];
     game.players[loser].hand[pt] = 0;
   }
 }
@@ -750,6 +766,64 @@ function worstCaptureLoss(board, alive, player) {
   return worst;
 }
 
+// Attacks-per-square for each owner: field[owner][r][c] = how many of that
+// owner's pieces attack (r,c). One reachable pass over the whole board.
+function attackField(board, alive) {
+  const f = [0, 1, 2, 3].map(() => Array.from({ length: 9 }, () => Array(9).fill(0)));
+  for (let r = 0; r < 9; r++)
+    for (let c = 0; c < 9; c++) {
+      const p = board[r][c];
+      if (!p || !alive[p.owner]) continue;
+      for (const [rr, rc] of getReachable(board, r, c)) f[p.owner][rr][rc]++;
+    }
+  return f;
+}
+
+function findKingPos(board, player) {
+  for (let r = 0; r < 9; r++)
+    for (let c = 0; c < 9; c++) {
+      const p = board[r][c];
+      if (p && p.owner === player && p.type === P.KING) return [r, c];
+    }
+  return null;
+}
+
+// `attacker`'s attacks landing on the king square or any of its 8 neighbours.
+function kingZonePressure(field, kr, kc, attacker) {
+  let n = 0;
+  for (let dr = -1; dr <= 1; dr++)
+    for (let dc = -1; dc <= 1; dc++) {
+      const r = kr + dr, c = kc + dc;
+      if (r >= 0 && r < 9 && c >= 0 && c < 9) n += field[attacker][r][c];
+    }
+  return n;
+}
+
+// Positional sense beyond raw material: press the enemy kings and keep my own
+// king safe. This is what stops the bots shuffling aimlessly in the midgame —
+// among equal-material moves they now prefer attacking and defending kings.
+function kingPlay(player, board, alive) {
+  const field = attackField(board, alive);
+  let adj = 0;
+  for (let e = 0; e < 4; e++) {
+    if (e === player || !alive[e]) continue;
+    const kp = findKingPos(board, e);
+    if (!kp) continue;
+    adj += kingZonePressure(field, kp[0], kp[1], player) * 0.10;     // pressure on enemy king
+    const esc = getValidMoves(board, kp[0], kp[1], e).length;
+    if (esc <= 2) adj += (3 - esc) * 0.35;                           // closing the mating net
+  }
+  const myk = findKingPos(board, player);
+  if (myk) {
+    let danger = 0;
+    for (let e = 0; e < 4; e++) if (e !== player && alive[e]) danger += kingZonePressure(field, myk[0], myk[1], e);
+    adj -= danger * 0.12;                                            // enemy pressure on my king
+    const esc = getValidMoves(board, myk[0], myk[1], player).length;
+    if (esc <= 2) adj -= (3 - esc) * 0.30;                           // my king boxed in
+  }
+  return adj;
+}
+
 // Material values indexed by piece type (pawn,silver,gold,rook,king,tokin,+silver,dragon)
 const PIECE_VALUE = [1, 5, 6, 11, 0, 7, 7, 13];
 
@@ -857,6 +931,7 @@ function chooseBotMove(player, level) {
     if (cfg.positional) {
       const after = applyToBoard(game.board, move);
       candidates[i].score += ownMobility(after, player) * 0.03;
+      candidates[i].score += kingPlay(player, after, alive);
       if (cfg.paranoid) candidates[i].score -= worstCaptureLoss(after, alive, player);
     }
   }
@@ -1100,7 +1175,9 @@ function renderBoard() {
         const pieceEl = document.createElement('div');
         pieceEl.className = `ys-piece player-${piece.owner} facing-${dirOf(piece)}`;
         if (isPromoted(piece.type)) pieceEl.classList.add('promoted');
-        if (piece.dead) pieceEl.classList.add('dead-king');
+        // Dead pieces: the eliminated king (obstacle) or, in 'scatter' mode, the
+        // loser's neutral pieces that anyone may capture.
+        if (piece.dead) pieceEl.classList.add(piece.type === P.KING ? 'dead-king' : 'dead-piece');
         pieceEl.textContent = KANJI[piece.type];
 
         // Check highlight on king
@@ -1408,7 +1485,8 @@ function initLobbyPage() {
   document.getElementById('ys-solo-btn')?.addEventListener('click', () => {
     const bots = document.getElementById('ys-bot-count')?.value || '3';
     const level = document.getElementById('ys-bot-level')?.value || 'medium';
-    window.location.href = '/solo?bots=' + bots + '&level=' + level;
+    const mode = document.getElementById('ys-capture-mode')?.value || 'inherit';
+    window.location.href = '/solo?bots=' + bots + '&level=' + level + '&mode=' + mode;
   });
   // Keep the difficulty tooltip in sync with the selected option.
   const lvl = document.getElementById('ys-bot-level');
@@ -1430,10 +1508,11 @@ function levelDesc(level) {
   return (window.i18n && window.i18n[k]) || fallback[level] || '';
 }
 
-function initSoloGame(numBots, level) {
+function initSoloGame(numBots, level, mode) {
   const botLevel = BOT_LEVELS[level] ? level : 'medium';
   const totalPlayers = Math.max(2, Math.min(4, (parseInt(numBots) || 3) + 1));
   game.local = true;
+  game.eliminationMode = validMode(mode);
   game.roomId = null;
   game.board = createInitialBoard();
   game.players = createInitialPlayers();
@@ -1464,6 +1543,7 @@ function initSoloGame(numBots, level) {
   game.status = 'playing';
   game.currentPlayer = 0;
   setupCpToggle();
+  setupLogToggle();
   clearSelection();
   renderAll();
   scheduleBotMove(); // in case seat 0 were ever a bot; harmless otherwise
@@ -1479,6 +1559,21 @@ function setupCpToggle() {
     game.showCp = box.checked;
     localStorage.setItem('ys_show_cp', box.checked ? '1' : '0');
     renderAll();
+  });
+}
+
+// Wire the "show move log" checkbox. The log is hidden by default; this restores
+// the saved preference and shows/hides the panel body on toggle.
+function setupLogToggle() {
+  const box = document.getElementById('ys-log-toggle');
+  const body = document.getElementById('ys-log-body');
+  if (!box || !body) return;
+  const show = localStorage.getItem('ys_show_log') === '1';
+  box.checked = show;
+  body.style.display = show ? '' : 'none';
+  box.addEventListener('change', () => {
+    localStorage.setItem('ys_show_log', box.checked ? '1' : '0');
+    body.style.display = box.checked ? '' : 'none';
   });
 }
 
@@ -1503,10 +1598,11 @@ function initGamePage(roomId) {
   document.getElementById('ys-copy-link')?.addEventListener('click', copyRoomLink);
   document.getElementById('ys-start-btn')?.addEventListener('click', startGame);
   setupCpToggle();
+  setupLogToggle();
 
   // Start polling
   pollState();
-  game.pollTimer = setInterval(pollState, 1500);
+  game.pollTimer = setInterval(pollState, 1000); // tracks the server's ~1s bot pace
 
   renderAll();
 }

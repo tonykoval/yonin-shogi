@@ -58,6 +58,10 @@ object Layout {
             li(cls := "nav-item")(
               a(cls := "nav-link", href := "/")(
                 i(cls := "bi bi-people-fill me-1"), I18n.t("nav.online"))
+            ),
+            li(cls := "nav-item")(
+              a(cls := "nav-link", href := "/about")(
+                i(cls := "bi bi-info-circle me-1"), I18n.t("nav.about"))
             )
           ),
           div(cls := "dropdown")(

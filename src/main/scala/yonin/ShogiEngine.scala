@@ -56,12 +56,14 @@ object ShogiEngine {
   }
   type Board = Array[Array[Piece]] // null = empty square
 
-  /** Mutable authoritative game state. hands(player)(pieceType 0..3). */
+  /** Mutable authoritative game state. hands(player)(pieceType 0..3).
+   *  `mode` controls what happens to a checkmated player's pieces — see eliminate. */
   final class GameState(
     var board: Board,
     val alive: Array[Boolean],
     val hands: Array[Array[Int]],
-    var currentPlayer: Int
+    var currentPlayer: Int,
+    var mode: String = "inherit"
   )
 
   sealed trait Move { def player: Int }
@@ -104,8 +106,8 @@ object ShogiEngine {
     b
   }
 
-  def initialState(alive: Array[Boolean], firstPlayer: Int): GameState =
-    new GameState(initialBoard(), alive.clone(), Array.fill(4, 4)(0), firstPlayer)
+  def initialState(alive: Array[Boolean], firstPlayer: Int, mode: String = "inherit"): GameState =
+    new GameState(initialBoard(), alive.clone(), Array.fill(4, 4)(0), firstPlayer, mode)
 
   def cloneBoard(b: Board): Board = {
     val nb = Array.ofDim[Piece](9, 9)
@@ -114,7 +116,7 @@ object ShogiEngine {
     nb
   }
   private def cloneState(st: GameState): GameState =
-    new GameState(cloneBoard(st.board), st.alive.clone(), st.hands.map(_.clone()), st.currentPlayer)
+    new GameState(cloneBoard(st.board), st.alive.clone(), st.hands.map(_.clone()), st.currentPlayer, st.mode)
 
   // ── Move generation ───────────────────────────────────────
   def reachable(b: Board, alive: Array[Boolean], r: Int, c: Int): ArrayBuffer[(Int, Int)] = {
@@ -289,8 +291,15 @@ object ShogiEngine {
     }
   }
 
+  // What happens to a checkmated player's pieces, by st.mode:
+  //  - "inherit" (default): the winner takes them over on the board, keeping the
+  //               eliminated player's facing (classic yonin rule).
+  //  - "hand":    every piece goes straight into the winner's hand (demoted).
+  //  - "scatter": pieces stay on the board as neutral "dead" pieces any player
+  //               can capture; the loser's hand is discarded.
   private def eliminate(st: GameState, loser: Int, winner: Int): Unit = {
     st.alive(loser) = false
+    val mode = st.mode
     var r = 0
     while (r < 9) {
       var c = 0
@@ -298,14 +307,16 @@ object ShogiEngine {
         val p = st.board(r)(c)
         if (p != null && p.owner == loser) {
           if (p.ptype == KING) p.dead = true
-          else { if (p.dir < 0) p.dir = p.owner; p.owner = winner } // keep original facing (yonin rule)
+          else if (mode == "hand") { st.hands(winner)(DEMOTE(p.ptype)) += 1; st.board(r)(c) = null }
+          else if (mode == "scatter") p.dead = true
+          else { if (p.dir < 0) p.dir = p.owner; p.owner = winner } // inherit: keep original facing
         }
         c += 1
       }
       r += 1
     }
     var pt = 0
-    while (pt < 4) { st.hands(winner)(pt) += st.hands(loser)(pt); st.hands(loser)(pt) = 0; pt += 1 }
+    while (pt < 4) { if (mode != "scatter") st.hands(winner)(pt) += st.hands(loser)(pt); st.hands(loser)(pt) = 0; pt += 1 }
   }
 
   /** Yonin turn order: a checked opponent moves next (clockwise-first if several);
@@ -392,6 +403,60 @@ object ShogiEngine {
 
   private def baseScore(cfg: Level, st: GameState, move: Move, rnd: scala.util.Random): Double =
     if (cfg.positional) positionalBase(st, move, rnd) else staticScore(st, move, rnd)
+
+  // Attacks-per-square for each owner: field(owner)(r)(c) = how many of that
+  // owner's pieces attack (r,c). One reachable pass over the whole board.
+  private def attackField(b: Board, alive: Array[Boolean]): Array[Array[Array[Int]]] = {
+    val f = Array.fill(4, 9, 9)(0)
+    var r = 0
+    while (r < 9) {
+      var c = 0
+      while (c < 9) {
+        val p = b(r)(c)
+        if (p != null && alive(p.owner)) {
+          val reach = reachable(b, alive, r, c); var i = 0
+          while (i < reach.length) { val (rr, rc) = reach(i); f(p.owner)(rr)(rc) += 1; i += 1 }
+        }
+        c += 1
+      }
+      r += 1
+    }
+    f
+  }
+
+  private def kingZonePressure(field: Array[Array[Array[Int]]], kr: Int, kc: Int, attacker: Int): Int = {
+    var n = 0; var dr = -1
+    while (dr <= 1) { var dc = -1; while (dc <= 1) { val r = kr + dr; val c = kc + dc; if (inBounds(r, c)) n += field(attacker)(r)(c); dc += 1 }; dr += 1 }
+    n
+  }
+
+  // Press the enemy kings and keep my own king safe — what stops the bots from
+  // shuffling aimlessly: among equal-material moves they attack and defend kings.
+  private def kingPlay(player: Int, b: Board, alive: Array[Boolean]): Double = {
+    val field = attackField(b, alive)
+    var adj = 0.0
+    var e = 0
+    while (e < 4) {
+      if (e != player && alive(e)) {
+        val (kr, kc) = findKing(b, e)
+        if (kr >= 0) {
+          adj += kingZonePressure(field, kr, kc, player) * 0.10
+          val esc = validMoves(b, alive, kr, kc, e).length
+          if (esc <= 2) adj += (3 - esc) * 0.35
+        }
+      }
+      e += 1
+    }
+    val (mkr, mkc) = findKing(b, player)
+    if (mkr >= 0) {
+      var danger = 0; var o = 0
+      while (o < 4) { if (o != player && alive(o)) danger += kingZonePressure(field, mkr, mkc, o); o += 1 }
+      adj -= danger * 0.12
+      val esc = validMoves(b, alive, mkr, mkc, player).length
+      if (esc <= 2) adj -= (3 - esc) * 0.30
+    }
+    adj
+  }
 
   private def canPromoteHere(piece: Piece, fr: Int, fc: Int, tr: Int, tc: Int): Boolean = {
     if (!CAN_PROMOTE(piece.ptype)) return false
@@ -532,6 +597,7 @@ object ShogiEngine {
             if (cfg.positional) {
               val after = boardAfter(st.board, m)
               bonus += ownMobility(after, st.alive, m.player) * 0.03
+              bonus += kingPlay(m.player, after, st.alive)
               if (cfg.paranoid) bonus -= worstCaptureLoss(after, st.alive, m.player)
             }
           }

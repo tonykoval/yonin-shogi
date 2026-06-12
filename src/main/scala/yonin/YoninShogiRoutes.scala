@@ -3,7 +3,7 @@ package yonin
 import scalatags.Text.all._
 
 import java.util.UUID
-import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.{ConcurrentHashMap, Executors, TimeUnit}
 import scala.collection.mutable
 
 /**
@@ -26,6 +26,7 @@ object YoninShogiRoutes extends cask.Routes {
 
   private val botLevels = Set("easy", "medium", "hard")
   private def validLevel(s: String): String = if (botLevels.contains(s)) s else "medium"
+  private def validMode(s: String): String = if (s == "hand" || s == "scatter") s else "inherit"
   private def botName(level: String): String = "Bot (" + validLevel(level).capitalize + ")"
 
   case class Room(
@@ -38,10 +39,22 @@ object YoninShogiRoutes extends cask.Routes {
     var createdAt: Long = System.currentTimeMillis(),
     // Authoritative board/rules state, created at game start. The server drives
     // bot seats and turn order from this; clients still replay `moves` to render.
-    var engine: ShogiEngine.GameState = null
+    var engine: ShogiEngine.GameState = null,
+    // True while a bot move is queued on the scheduler — prevents a second chain
+    // from being started (e.g. by a poll arriving mid-think).
+    var botPending: Boolean = false,
+    // Elimination rule chosen by the host at start: inherit | hand | scatter.
+    var mode: String = "inherit"
   )
 
   private val rooms = new ConcurrentHashMap[String, Room]()
+
+  // Online bots are paced one move at a time so they don't all move instantly
+  // between a player's turns. Daemon threads so they never block JVM shutdown.
+  private val BotMoveDelayMs = 1000L
+  private val botScheduler = Executors.newScheduledThreadPool(2, (r: Runnable) => {
+    val t = new Thread(r, "yonin-bot"); t.setDaemon(true); t
+  })
 
   // Cleanup old rooms (>24h) periodically
   private def cleanupOldRooms(): Unit = {
@@ -104,23 +117,38 @@ object YoninShogiRoutes extends cask.Routes {
     }
   }
 
-  // Play out every consecutive bot turn until it's a human's move (or game over).
-  private def driveBots(room: Room): Unit = {
-    var guard = 0
-    while (room.status == "playing" && room.engine != null && guard < 400 &&
-           room.players(room.engine.currentPlayer).isBot) {
-      guard += 1
-      val st = room.engine
-      val seat = st.currentPlayer
-      ShogiEngine.chooseBotMove(st, seat, room.players(seat).botLevel, room.moves.length) match {
-        case Some(move) =>
-          ShogiEngine.applyMove(st, move)
-          room.moves += ShogiEngine.moveToJson(move, Some(room.players(seat).botLevel))
-          advanceAfterMove(room)
-        case None =>
-          // No legal move (rare) — concede this seat and continue.
-          st.alive(seat) = false
-          advanceAfterMove(room)
+  // If it's a bot's turn, queue exactly one bot move after a short delay. Each
+  // move re-schedules the next, so consecutive bots play out one-at-a-time at a
+  // human-perceptible pace instead of all at once. Callers hold the room monitor.
+  private def scheduleBots(room: Room): Unit = {
+    if (room.status == "playing" && room.engine != null && !room.botPending &&
+        room.players(room.engine.currentPlayer).isBot) {
+      room.botPending = true
+      botScheduler.schedule(new Runnable { def run(): Unit = playOneBot(room) },
+        BotMoveDelayMs, TimeUnit.MILLISECONDS)
+    }
+  }
+
+  // Play a single queued bot move, then chain the next one if needed.
+  private def playOneBot(room: Room): Unit = {
+    room.synchronized {
+      room.botPending = false
+      if (room.status == "playing" && room.engine != null) {
+        val st = room.engine
+        val seat = st.currentPlayer
+        if (room.players(seat).isBot) {
+          ShogiEngine.chooseBotMove(st, seat, room.players(seat).botLevel, room.moves.length) match {
+            case Some(move) =>
+              ShogiEngine.applyMove(st, move)
+              room.moves += ShogiEngine.moveToJson(move, Some(room.players(seat).botLevel))
+              advanceAfterMove(room)
+            case None =>
+              // No legal move (rare) — concede this seat and continue.
+              st.alive(seat) = false
+              advanceAfterMove(room)
+          }
+          scheduleBots(room)
+        }
       }
     }
   }
@@ -158,12 +186,20 @@ object YoninShogiRoutes extends cask.Routes {
     htmlResponse(renderTutorialPage().render, request)
   }
 
+  // About / credits page with a link to the source on GitHub.
+  @cask.get("/about")
+  def aboutPage(request: cask.Request) = {
+    implicit val lang: String = getLang(request)
+    htmlResponse(renderAboutPage().render, request)
+  }
+
   // Single-player game against bots — runs entirely client-side, no room needed.
   @cask.get("/solo")
-  def soloPage(request: cask.Request, bots: Int = 3, level: String = "medium") = {
+  def soloPage(request: cask.Request, bots: Int = 3, level: String = "medium", mode: String = "inherit") = {
     implicit val lang: String = getLang(request)
     val clampedBots = math.max(1, math.min(3, bots))
-    htmlResponse(renderGamePage("", soloBots = Some(clampedBots), soloLevel = validLevel(level)).render, request)
+    htmlResponse(renderGamePage("", soloBots = Some(clampedBots), soloLevel = validLevel(level),
+      soloMode = validMode(mode)).render, request)
   }
 
   // ── API ─────────────────────────────────────────────────
@@ -278,6 +314,8 @@ object YoninShogiRoutes extends cask.Routes {
     if (room == null) {
       json(ujson.Obj("success" -> false, "error" -> "Room not found"))
     } else {
+      val mode = validMode(
+        scala.util.Try(ujson.read(request.text()).obj.get("mode").map(_.str)).toOption.flatten.getOrElse("inherit"))
       room.synchronized {
         val connectedCount = room.players.count(_.connected)
         if (connectedCount < 2) {
@@ -295,10 +333,11 @@ object YoninShogiRoutes extends cask.Routes {
           // Find first connected player and spin up the authoritative engine.
           room.currentPlayer = room.players.indexWhere(_.connected)
           val alive = Array.tabulate(4)(i => room.players(i).connected)
-          room.engine = ShogiEngine.initialState(alive, room.currentPlayer)
+          room.mode = mode
+          room.engine = ShogiEngine.initialState(alive, room.currentPlayer, mode)
           // If the opening seat is a bot, let the server play it (and any bots
-          // that follow) right away.
-          driveBots(room)
+          // that follow), paced one move at a time.
+          scheduleBots(room)
           json(ujson.Obj("success" -> true))
         }
       }
@@ -310,7 +349,8 @@ object YoninShogiRoutes extends cask.Routes {
     val room = rooms.get(roomId)
     if (room == null) {
       json(ujson.Obj("error" -> "Room not found"))
-    } else {
+    } else room.synchronized {
+      // Snapshot under the monitor: bot moves mutate this state from a scheduler thread.
       val playersJson = ujson.Arr(room.players.zipWithIndex.map { case (p, i) =>
         ujson.Obj(
           "id" -> i,
@@ -327,6 +367,7 @@ object YoninShogiRoutes extends cask.Routes {
         "roomId" -> room.id,
         "status" -> room.status,
         "currentPlayer" -> room.currentPlayer,
+        "mode" -> room.mode,
         "players" -> playersJson,
         "moves" -> ujson.Arr(room.moves.toSeq: _*),
         "winner" -> (room.winner match { case Some(w) => ujson.Num(w); case None => ujson.Null })
@@ -357,7 +398,7 @@ object YoninShogiRoutes extends cask.Routes {
           ShogiEngine.applyMove(room.engine, parsed)
           room.moves += move
           advanceAfterMove(room)
-          driveBots(room)
+          scheduleBots(room)
           json(ujson.Obj("success" -> true))
         }
       }
@@ -388,6 +429,76 @@ object YoninShogiRoutes extends cask.Routes {
   }
 
   // ── HTML rendering ──────────────────────────────────────
+
+  val githubUrl = "https://github.com/tonykoval/yonin-shogi"
+  val githubIssuesUrl = githubUrl + "/issues"
+  val authorEmail = "aktealc@gmail.com"
+
+  def renderAboutPage()(implicit lang: String) = {
+    tag("html")(attr("lang") := lang, cls := "dark")(
+      Layout.headFrag(I18n.t("about.pageTitle")),
+      body(cls := "wood")(
+        Layout.headerFrag,
+        div(cls := "container py-4", style := "max-width: 720px;")(
+          h1(cls := "display-6 fw-bold mb-3 text-center")(
+            i(cls := "bi bi-info-circle me-3", style := "color: #e8a317;"),
+            I18n.t("about.title")
+          ),
+          div(cls := "card bg-dark text-light border-secondary")(
+            div(cls := "card-body")(
+              p(cls := "lead")(I18n.t("about.intro")),
+              p(I18n.t("about.rules")),
+              p(cls := "mb-0 text-light-50")(I18n.t("about.tech")),
+              hr(cls := "border-secondary"),
+              p(cls := "mb-1")(
+                i(cls := "bi bi-person-fill me-2", style := "color: #e8a317;"),
+                I18n.t("about.credits")
+              ),
+              p(cls := "mb-3 text-light-50")(I18n.t("about.contact")),
+              div(cls := "d-flex flex-wrap gap-2")(
+                a(cls := "btn btn-outline-light", href := githubUrl,
+                  attr("target") := "_blank", attr("rel") := "noopener")(
+                  i(cls := "bi bi-github me-2"), I18n.t("about.github")
+                ),
+                a(cls := "btn btn-outline-warning", href := githubIssuesUrl,
+                  attr("target") := "_blank", attr("rel") := "noopener")(
+                  i(cls := "bi bi-bug-fill me-2"), I18n.t("about.reportIssue")
+                ),
+                a(cls := "btn btn-outline-light", href := s"mailto:$authorEmail")(
+                  i(cls := "bi bi-envelope-fill me-2"), I18n.t("about.emailMe")
+                ),
+                a(cls := "btn btn-outline-info", href := "/tutorial")(
+                  i(cls := "bi bi-mortarboard-fill me-2"), I18n.t("yonin.tutorial")
+                ),
+                a(cls := "btn btn-warning", href := "/solo?bots=3")(
+                  i(cls := "bi bi-play-circle me-2"), I18n.t("nav.solo")
+                )
+              ),
+              hr(cls := "border-secondary"),
+              p(cls := "mb-0 small text-light-50")(
+                i(cls := "bi bi-file-earmark-text me-2"),
+                a(cls := "link-light", href := s"$githubUrl/blob/main/LICENSE",
+                  attr("target") := "_blank", attr("rel") := "noopener")(I18n.t("about.license"))
+              )
+            )
+          )
+        )
+      )
+    )
+  }
+
+  // "When you checkmate someone" rule picker, shared by the solo card and the
+  // online room lobby. The id is read by the JS on solo launch / game start.
+  def captureModeSelect()(implicit lang: String) =
+    div(cls := "mb-3")(
+      label(cls := "form-label small")(I18n.t("yonin.captureMode")),
+      select(id := "ys-capture-mode", cls := "form-select bg-dark text-light border-secondary mx-auto",
+        style := "max-width: 240px;")(
+        option(value := "inherit", selected := "selected", attr("title") := I18n.t("yonin.modeInheritDesc"))(I18n.t("yonin.modeInherit")),
+        option(value := "hand", attr("title") := I18n.t("yonin.modeHandDesc"))(I18n.t("yonin.modeHand")),
+        option(value := "scatter", attr("title") := I18n.t("yonin.modeScatterDesc"))(I18n.t("yonin.modeScatter"))
+      )
+    )
 
   def renderLobbyPage()(implicit lang: String) = {
     tag("html")(attr("lang") := lang, cls := "dark")(
@@ -434,6 +545,7 @@ object YoninShogiRoutes extends cask.Routes {
                   option(value := "hard", attr("title") := I18n.t("yonin.hardDesc"))(I18n.t("yonin.hard"))
                 )
               ),
+              captureModeSelect(),
               button(cls := "btn btn-warning btn-lg", id := "ys-solo-btn")(
                 i(cls := "bi bi-play-circle me-2"),
                 I18n.t("yonin.playSolo")
@@ -479,10 +591,11 @@ object YoninShogiRoutes extends cask.Routes {
     )
   }
 
-  def renderGamePage(roomId: String, soloBots: Option[Int] = None, soloLevel: String = "medium")(implicit lang: String) = {
+  def renderGamePage(roomId: String, soloBots: Option[Int] = None, soloLevel: String = "medium",
+                     soloMode: String = "inherit")(implicit lang: String) = {
     val isSolo = soloBots.isDefined
     val initScript = soloBots match {
-      case Some(n) => s"YoninShogi.initSoloGame($n, '${validLevel(soloLevel)}');"
+      case Some(n) => s"YoninShogi.initSoloGame($n, '${validLevel(soloLevel)}', '${validMode(soloMode)}');"
       case None    => s"YoninShogi.initGamePage('$roomId');"
     }
     tag("html")(attr("lang") := lang, cls := "dark")(
@@ -509,6 +622,7 @@ object YoninShogiRoutes extends cask.Routes {
                 placeholder := I18n.t("yonin.namePlaceholder"), maxlength := "20")
             ),
             div(id := "ys-seats", cls := "ys-lobby-seats mb-3"),
+            captureModeSelect(),
             button(cls := "btn btn-success btn-lg", id := "ys-start-btn", style := "display:none;")(
               i(cls := "bi bi-play-fill me-2"),
               I18n.t("yonin.startGame")
@@ -551,12 +665,18 @@ object YoninShogiRoutes extends cask.Routes {
                 div(cls := "card bg-dark text-light border-secondary")(
                   div(cls := "card-header d-flex justify-content-between align-items-center")(
                     h6(cls := "mb-0")(i(cls := "bi bi-list-ol me-2"), I18n.t("yonin.moveLog")),
-                    div(cls := "form-check form-switch mb-0", attr("title") := I18n.t("yonin.cpHint"))(
-                      input(`type` := "checkbox", cls := "form-check-input", id := "ys-cp-toggle"),
-                      label(cls := "form-check-label small ms-1", attr("for") := "ys-cp-toggle")(I18n.t("yonin.showCp"))
+                    div(cls := "d-flex gap-3 align-items-center")(
+                      div(cls := "form-check form-switch mb-0", attr("title") := I18n.t("yonin.cpHint"))(
+                        input(`type` := "checkbox", cls := "form-check-input", id := "ys-cp-toggle"),
+                        label(cls := "form-check-label small ms-1", attr("for") := "ys-cp-toggle")(I18n.t("yonin.showCp"))
+                      ),
+                      div(cls := "form-check form-switch mb-0", attr("title") := I18n.t("yonin.logHint"))(
+                        input(`type` := "checkbox", cls := "form-check-input", id := "ys-log-toggle"),
+                        label(cls := "form-check-label small ms-1", attr("for") := "ys-log-toggle")(I18n.t("yonin.showLog"))
+                      )
                     )
                   ),
-                  div(cls := "card-body p-2")(
+                  div(id := "ys-log-body", cls := "card-body p-2", style := "display:none;")(
                     div(id := "ys-move-log", cls := "ys-move-log")
                   )
                 ),

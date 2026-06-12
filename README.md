@@ -70,3 +70,7 @@ src/main/resources/
   assets/css/  yonin-shogi.css, app.css
   i18n/ en.json, sk.json
 ```
+
+## License
+
+Licensed under the [Apache License 2.0](LICENSE). Copyright 2026 Tony Koval.
