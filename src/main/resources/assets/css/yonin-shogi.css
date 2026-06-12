@@ -29,11 +29,17 @@
     ".         hand-north .        "
     "hand-west board      hand-east"
     ".         hand-south .        ";
-  grid-template-columns: auto auto auto;
-  grid-template-rows: auto auto auto;
+  /* Fixed-size gutters for the hands so capturing/dropping never resizes a track
+     and shifts the board — the board cell stays pinned while hands change. */
+  --ys-gutter: calc(var(--ys-cell-size) * 1.2);
+  grid-template-columns: var(--ys-gutter) auto var(--ys-gutter);
+  grid-template-rows: var(--ys-gutter) auto var(--ys-gutter);
   gap: 6px;
   align-items: center;
   justify-items: center;
+  /* Board rotation is applied as an inline transform (0/90/180/270deg). */
+  transform-origin: center center;
+  transition: transform .35s ease;
 }
 
 /* ── Board ── */
@@ -152,7 +158,10 @@
   padding: 4px 6px;
   background: rgba(0,0,0,.25);
   border-radius: 6px;
-  min-height: calc(var(--ys-cell-size) * 0.7);
+  /* Reserve a full piece row/column (incl. padding) so an empty hand and a
+     filled one are the same size and the board never jumps. */
+  min-height: calc(var(--ys-cell-size) * 0.7 + 8px);
+  min-width: calc(var(--ys-cell-size) * 0.65 + 12px);
   align-items: center;
 }
 
@@ -336,6 +345,9 @@
 .ys-move-log .player-1 { color: var(--ys-west-color); }
 .ys-move-log .player-2 { color: var(--ys-north-color); }
 .ys-move-log .player-3 { color: var(--ys-east-color); }
+
+/* Bot centipawn eval shown after a move when the toggle is on. */
+.ys-move-log .ys-cp { color: #9fe6a0; opacity: .85; font-variant-numeric: tabular-nums; }
 
 /* ── Tutorial ── */
 /* Shrink the board so it fits beside the instruction column without overlap */

@@ -32,10 +32,10 @@ sbt run        # starts on http://0.0.0.0:8080
 
 Then open:
 
-- `/` or `/yonin-shogi` — lobby (solo / online / tutorial)
-- `/yonin-shogi/tutorial` — interactive rules tutorial
-- `/yonin-shogi/solo?bots=3` — play against 1–3 bots
-- `/yonin-shogi/game/:roomId` — an online room
+- `/` — lobby (solo / online / tutorial)
+- `/tutorial` — interactive rules tutorial
+- `/solo?bots=3` — play against 1–3 bots
+- `/game/:roomId` — an online room
 
 ### Build a fat JAR
 

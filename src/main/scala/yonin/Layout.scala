@@ -10,6 +10,14 @@ import scalatags.Text.tags2.{title => titleTag}
  */
 object Layout {
 
+  /** Cache-busting token appended to local JS/CSS URLs. It changes on every
+   *  server start, so after a rebuild browsers re-fetch the assets instead of
+   *  serving a stale cached copy (StaticRoutes sets a 1h cache). */
+  val assetVersion: String = System.currentTimeMillis().toString
+
+  /** Append the cache-busting token to a local asset path. */
+  def asset(path: String): String = s"$path?v=$assetVersion"
+
   /** Common <head>: meta, Bootstrap + icons CDN, and the app's own stylesheets. */
   def headFrag(pageTitle: String): Frag =
     head(
@@ -18,8 +26,8 @@ object Layout {
       titleTag(pageTitle),
       link(rel := "stylesheet", href := "https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css"),
       link(rel := "stylesheet", href := "https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css"),
-      link(rel := "stylesheet", href := "/assets/css/app.css"),
-      link(rel := "stylesheet", href := "/assets/css/yonin-shogi.css")
+      link(rel := "stylesheet", href := asset("/assets/css/app.css")),
+      link(rel := "stylesheet", href := asset("/assets/css/yonin-shogi.css"))
     )
 
   /** Minimal navbar: brand + Tutorial / Solo / Online links + language toggle. */
@@ -40,15 +48,15 @@ object Layout {
         div(cls := "collapse navbar-collapse", id := "ys-nav")(
           ul(cls := "navbar-nav me-auto mb-2 mb-lg-0")(
             li(cls := "nav-item")(
-              a(cls := "nav-link", href := "/yonin-shogi/tutorial")(
+              a(cls := "nav-link", href := "/tutorial")(
                 i(cls := "bi bi-mortarboard-fill me-1"), I18n.t("nav.tutorial"))
             ),
             li(cls := "nav-item")(
-              a(cls := "nav-link", href := "/yonin-shogi/solo?bots=3")(
+              a(cls := "nav-link", href := "/solo?bots=3")(
                 i(cls := "bi bi-robot me-1"), I18n.t("nav.solo"))
             ),
             li(cls := "nav-item")(
-              a(cls := "nav-link", href := "/yonin-shogi")(
+              a(cls := "nav-link", href := "/")(
                 i(cls := "bi bi-people-fill me-1"), I18n.t("nav.online"))
             )
           ),

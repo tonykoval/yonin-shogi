@@ -47,12 +47,14 @@ object StaticRoutes extends cask.Routes {
     }
   }
 
+  // `v` is an ignored cache-busting token (see Layout.asset). It must be a
+  // declared param because Cask rejects undeclared query params.
   @cask.get("/js/:path", subpath = true)
-  def js(path: String, request: cask.Request): cask.Response[Array[Byte]] =
+  def js(path: String, request: cask.Request, v: String = ""): cask.Response[Array[Byte]] =
     serve("js/" + path, path)
 
   @cask.get("/assets/css/:path", subpath = true)
-  def css(path: String, request: cask.Request): cask.Response[Array[Byte]] =
+  def css(path: String, request: cask.Request, v: String = ""): cask.Response[Array[Byte]] =
     serve("assets/css/" + path, path)
 
   initialize()

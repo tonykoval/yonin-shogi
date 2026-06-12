@@ -35,7 +35,10 @@ object YoninShogiRoutes extends cask.Routes {
     var status: String = "waiting",     // waiting | playing | finished
     var currentPlayer: Int = 0,
     var winner: Option[Int] = None,
-    var createdAt: Long = System.currentTimeMillis()
+    var createdAt: Long = System.currentTimeMillis(),
+    // Authoritative board/rules state, created at game start. The server drives
+    // bot seats and turn order from this; clients still replay `moves` to render.
+    var engine: ShogiEngine.GameState = null
   )
 
   private val rooms = new ConcurrentHashMap[String, Room]()
@@ -67,13 +70,68 @@ object YoninShogiRoutes extends cask.Routes {
   private def json(value: ujson.Value): cask.Response[ujson.Value] =
     cask.Response(value, headers = Seq("Content-Type" -> "application/json"))
 
+  // ── Engine ↔ room sync (callers must hold room's monitor) ──
+
+  // Copy alive flags and hand counts from the authoritative engine back into the
+  // PlayerSlots that /api/state serializes.
+  private def syncRoomFromState(room: Room): Unit = {
+    val st = room.engine
+    var i = 0
+    while (i < 4) {
+      val h = room.players(i).hand
+      h(0) = st.hands(i)(0); h(1) = st.hands(i)(1); h(2) = st.hands(i)(2); h(3) = st.hands(i)(3)
+      if (room.players(i).alive != st.alive(i)) room.players(i) = room.players(i).copy(alive = st.alive(i))
+      i += 1
+    }
+    room.currentPlayer = st.currentPlayer
+  }
+
+  // True when the game just ended (≤1 player left), recording the winner.
+  private def checkGameOver(room: Room): Boolean = {
+    if (ShogiEngine.aliveCount(room.engine) <= 1) {
+      room.status = "finished"
+      room.winner = (0 until 4).find(room.engine.alive(_))
+      true
+    } else false
+  }
+
+  // After a move has been applied to the engine: sync, end the game or pass the turn.
+  private def advanceAfterMove(room: Room): Unit = {
+    syncRoomFromState(room)
+    if (!checkGameOver(room)) {
+      ShogiEngine.advanceTurn(room.engine)
+      room.currentPlayer = room.engine.currentPlayer
+    }
+  }
+
+  // Play out every consecutive bot turn until it's a human's move (or game over).
+  private def driveBots(room: Room): Unit = {
+    var guard = 0
+    while (room.status == "playing" && room.engine != null && guard < 400 &&
+           room.players(room.engine.currentPlayer).isBot) {
+      guard += 1
+      val st = room.engine
+      val seat = st.currentPlayer
+      ShogiEngine.chooseBotMove(st, seat, room.players(seat).botLevel, room.moves.length) match {
+        case Some((move, cp)) =>
+          ShogiEngine.applyMove(st, move)
+          room.moves += ShogiEngine.moveToJson(move, Some(cp), Some(room.players(seat).botLevel))
+          advanceAfterMove(room)
+        case None =>
+          // No legal move (rare) — concede this seat and continue.
+          st.alive(seat) = false
+          advanceAfterMove(room)
+      }
+    }
+  }
+
   // ── Pages ───────────────────────────────────────────────
 
   // Switch UI language: set the cookie and bounce back to the page we came from.
   @cask.get("/lang/:code")
   def setLang(code: String, request: cask.Request) = {
     val valid = I18n.validateLang(code)
-    val back = request.headers.get("referer").flatMap(_.headOption).getOrElse("/yonin-shogi")
+    val back = request.headers.get("referer").flatMap(_.headOption).getOrElse("/")
     cask.Response("", statusCode = 302, headers = Seq(
       "Location" -> back,
       "Set-Cookie" -> s"lang=$valid; Path=/; SameSite=Strict"
@@ -81,30 +139,27 @@ object YoninShogiRoutes extends cask.Routes {
   }
 
   @cask.get("/")
-  def rootPage(request: cask.Request) = lobbyPage(request)
-
-  @cask.get("/yonin-shogi")
   def lobbyPage(request: cask.Request) = {
     implicit val lang: String = getLang(request)
     htmlResponse(renderLobbyPage().render, request)
   }
 
-  @cask.get("/yonin-shogi/game/:roomId")
+  @cask.get("/game/:roomId")
   def gamePage(roomId: String, request: cask.Request) = {
     implicit val lang: String = getLang(request)
-    if (!rooms.containsKey(roomId)) noCacheRedirect("/yonin-shogi")
+    if (!rooms.containsKey(roomId)) noCacheRedirect("/")
     else htmlResponse(renderGamePage(roomId).render, request)
   }
 
   // Interactive rules tutorial — runs entirely client-side.
-  @cask.get("/yonin-shogi/tutorial")
+  @cask.get("/tutorial")
   def tutorialPage(request: cask.Request) = {
     implicit val lang: String = getLang(request)
     htmlResponse(renderTutorialPage().render, request)
   }
 
   // Single-player game against bots — runs entirely client-side, no room needed.
-  @cask.get("/yonin-shogi/solo")
+  @cask.get("/solo")
   def soloPage(request: cask.Request, bots: Int = 3, level: String = "medium") = {
     implicit val lang: String = getLang(request)
     val clampedBots = math.max(1, math.min(3, bots))
@@ -113,7 +168,7 @@ object YoninShogiRoutes extends cask.Routes {
 
   // ── API ─────────────────────────────────────────────────
 
-  @cask.post("/yonin-shogi/api/create")
+  @cask.post("/api/create")
   def apiCreate(request: cask.Request) = {
     cleanupOldRooms()
     val id = UUID.randomUUID().toString.take(8)
@@ -121,7 +176,7 @@ object YoninShogiRoutes extends cask.Routes {
     json(ujson.Obj("roomId" -> id))
   }
 
-  @cask.post("/yonin-shogi/api/join/:roomId")
+  @cask.post("/api/join/:roomId")
   def apiJoin(roomId: String, request: cask.Request) = {
     val room = rooms.get(roomId)
     if (room == null) {
@@ -147,7 +202,7 @@ object YoninShogiRoutes extends cask.Routes {
   // Add a bot to an empty seat (only while the room is waiting). Bots are run
   // client-side by the host (lowest-index connected human); the server just
   // tracks that the seat is occupied by a bot of a given strength.
-  @cask.post("/yonin-shogi/api/addbot/:roomId")
+  @cask.post("/api/addbot/:roomId")
   def apiAddBot(roomId: String, request: cask.Request) = {
     val room = rooms.get(roomId)
     if (room == null) {
@@ -173,7 +228,7 @@ object YoninShogiRoutes extends cask.Routes {
   }
 
   // Remove a bot from a seat (only while waiting).
-  @cask.post("/yonin-shogi/api/removebot/:roomId")
+  @cask.post("/api/removebot/:roomId")
   def apiRemoveBot(roomId: String, request: cask.Request) = {
     val room = rooms.get(roomId)
     if (room == null) {
@@ -194,7 +249,30 @@ object YoninShogiRoutes extends cask.Routes {
     }
   }
 
-  @cask.post("/yonin-shogi/api/start/:roomId")
+  // Leave a seat (only while waiting). Also used when changing seats: the client
+  // joins the new seat first, then vacates the old one via this endpoint.
+  @cask.post("/api/leave/:roomId")
+  def apiLeave(roomId: String, request: cask.Request) = {
+    val room = rooms.get(roomId)
+    if (room == null) {
+      json(ujson.Obj("success" -> false, "error" -> "Room not found"))
+    } else {
+      val data = ujson.read(request.text())
+      val seat = data("seat").num.toInt
+      room.synchronized {
+        if (room.status != "waiting") {
+          json(ujson.Obj("success" -> false, "error" -> "Game already started"))
+        } else if (seat >= 0 && seat <= 3 && room.players(seat).connected && !room.players(seat).isBot) {
+          room.players(seat) = PlayerSlot()
+          json(ujson.Obj("success" -> true))
+        } else {
+          json(ujson.Obj("success" -> false, "error" -> "Not your seat"))
+        }
+      }
+    }
+  }
+
+  @cask.post("/api/start/:roomId")
   def apiStart(roomId: String, request: cask.Request) = {
     val room = rooms.get(roomId)
     if (room == null) {
@@ -214,15 +292,20 @@ object YoninShogiRoutes extends cask.Routes {
               room.players(i) = room.players(i).copy(alive = false)
             }
           }
-          // Find first connected player
+          // Find first connected player and spin up the authoritative engine.
           room.currentPlayer = room.players.indexWhere(_.connected)
+          val alive = Array.tabulate(4)(i => room.players(i).connected)
+          room.engine = ShogiEngine.initialState(alive, room.currentPlayer)
+          // If the opening seat is a bot, let the server play it (and any bots
+          // that follow) right away.
+          driveBots(room)
           json(ujson.Obj("success" -> true))
         }
       }
     }
   }
 
-  @cask.get("/yonin-shogi/api/state/:roomId")
+  @cask.get("/api/state/:roomId")
   def apiState(roomId: String, request: cask.Request) = {
     val room = rooms.get(roomId)
     if (room == null) {
@@ -251,7 +334,7 @@ object YoninShogiRoutes extends cask.Routes {
     }
   }
 
-  @cask.post("/yonin-shogi/api/move/:roomId")
+  @cask.post("/api/move/:roomId")
   def apiMove(roomId: String, request: cask.Request) = {
     val room = rooms.get(roomId)
     if (room == null) {
@@ -262,30 +345,19 @@ object YoninShogiRoutes extends cask.Routes {
       val move = data("move")
 
       room.synchronized {
-        if (room.status != "playing") {
+        if (room.status != "playing" || room.engine == null) {
           json(ujson.Obj("success" -> false, "error" -> "Game not in progress"))
         } else if (seat != room.currentPlayer) {
           json(ujson.Obj("success" -> false, "error" -> "Not your turn"))
         } else {
-          // Store the move
+          // Trust the client's own-move legality (it validated it), but apply it
+          // to the authoritative board so we can resolve checkmate/turn order and
+          // drive bots. Then store it verbatim for clients to replay.
+          val parsed = ShogiEngine.parseMove(move, seat)
+          ShogiEngine.applyMove(room.engine, parsed)
           room.moves += move
-
-          // Advance turn to next alive player
-          var next = (room.currentPlayer + 1) % 4
-          var attempts = 0
-          while (!room.players(next).alive && attempts < 4) {
-            next = (next + 1) % 4
-            attempts += 1
-          }
-          room.currentPlayer = next
-
-          // Check if game is over (1 player left)
-          val alivePlayers = room.players.zipWithIndex.filter(_._1.alive)
-          if (alivePlayers.length <= 1) {
-            room.status = "finished"
-            room.winner = alivePlayers.headOption.map(_._2)
-          }
-
+          advanceAfterMove(room)
+          driveBots(room)
           json(ujson.Obj("success" -> true))
         }
       }
@@ -293,7 +365,7 @@ object YoninShogiRoutes extends cask.Routes {
   }
 
   // Server-side elimination notification from client
-  @cask.post("/yonin-shogi/api/eliminate/:roomId")
+  @cask.post("/api/eliminate/:roomId")
   def apiEliminate(roomId: String, request: cask.Request) = {
     val room = rooms.get(roomId)
     if (room == null) {
@@ -330,7 +402,7 @@ object YoninShogiRoutes extends cask.Routes {
           p(cls := "lead text-light-50 mb-4")(I18n.t("yonin.subtitle")),
 
           div(cls := "mb-4")(
-            a(cls := "btn btn-outline-info btn-lg", href := "/yonin-shogi/tutorial")(
+            a(cls := "btn btn-outline-info btn-lg", href := "/tutorial")(
               i(cls := "bi bi-mortarboard-fill me-2"),
               I18n.t("yonin.tutorial")
             )
@@ -356,10 +428,10 @@ object YoninShogiRoutes extends cask.Routes {
               div(cls := "mb-3")(
                 label(cls := "form-label small")(I18n.t("yonin.difficulty")),
                 select(id := "ys-bot-level", cls := "form-select bg-dark text-light border-secondary mx-auto",
-                  style := "max-width: 200px;")(
-                  option(value := "easy")(I18n.t("yonin.easy")),
-                  option(value := "medium", selected := "selected")(I18n.t("yonin.medium")),
-                  option(value := "hard")(I18n.t("yonin.hard"))
+                  style := "max-width: 200px;", attr("title") := I18n.t("yonin.mediumDesc"))(
+                  option(value := "easy", attr("title") := I18n.t("yonin.easyDesc"))(I18n.t("yonin.easy")),
+                  option(value := "medium", selected := "selected", attr("title") := I18n.t("yonin.mediumDesc"))(I18n.t("yonin.medium")),
+                  option(value := "hard", attr("title") := I18n.t("yonin.hardDesc"))(I18n.t("yonin.hard"))
                 )
               ),
               button(cls := "btn btn-warning btn-lg", id := "ys-solo-btn")(
@@ -401,7 +473,7 @@ object YoninShogiRoutes extends cask.Routes {
         ),
         script(src := "https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"),
         script(raw(s"window.i18n = ${I18n.messagesAsJson(lang)};")),
-        script(src := "/js/yonin-shogi.js"),
+        script(src := Layout.asset("/js/yonin-shogi.js")),
         script(raw("YoninShogi.initLobbyPage();"))
       )
     )
@@ -454,6 +526,13 @@ object YoninShogiRoutes extends cask.Routes {
                 div(id := "ys-status", cls := "text-center mb-2 fs-5"),
                 // Player cards
                 div(id := "ys-player-cards", cls := "ys-players mb-2"),
+                // Board controls
+                div(cls := "text-center mb-2")(
+                  button(cls := "btn btn-outline-light btn-sm", id := "ys-rotate-btn",
+                    onclick := "YoninShogi.rotateBoard()", attr("title") := I18n.t("yonin.rotate"))(
+                    i(cls := "bi bi-arrow-clockwise me-1"), I18n.t("yonin.rotate")
+                  )
+                ),
                 // Board with hands
                 div(cls := "ys-wrapper")(
                   div(cls := "ys-board-area")(
@@ -468,18 +547,22 @@ object YoninShogiRoutes extends cask.Routes {
               // Side panel
               div(cls := "col-lg-4")(
                 div(cls := "card bg-dark text-light border-secondary")(
-                  div(cls := "card-header")(
-                    h6(cls := "mb-0")(i(cls := "bi bi-list-ol me-2"), I18n.t("yonin.moveLog"))
+                  div(cls := "card-header d-flex justify-content-between align-items-center")(
+                    h6(cls := "mb-0")(i(cls := "bi bi-list-ol me-2"), I18n.t("yonin.moveLog")),
+                    div(cls := "form-check form-switch mb-0", attr("title") := I18n.t("yonin.cpHint"))(
+                      input(`type` := "checkbox", cls := "form-check-input", id := "ys-cp-toggle"),
+                      label(cls := "form-check-label small ms-1", attr("for") := "ys-cp-toggle")(I18n.t("yonin.showCp"))
+                    )
                   ),
                   div(cls := "card-body p-2")(
                     div(id := "ys-move-log", cls := "ys-move-log")
                   )
                 ),
                 div(id := "ys-solo-controls", cls := "mt-2 text-center", style := "display:none;")(
-                  a(cls := "btn btn-warning btn-sm me-2", href := "/yonin-shogi/solo")(
+                  a(cls := "btn btn-warning btn-sm me-2", href := "/solo")(
                     i(cls := "bi bi-arrow-repeat me-1"), I18n.t("yonin.playAgain")
                   ),
-                  a(cls := "btn btn-outline-secondary btn-sm", href := "/yonin-shogi")(
+                  a(cls := "btn btn-outline-secondary btn-sm", href := "/")(
                     i(cls := "bi bi-house me-1"), I18n.t("yonin.backToLobby")
                   )
                 ),
@@ -496,7 +579,7 @@ object YoninShogiRoutes extends cask.Routes {
 
         script(src := "https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"),
         script(raw(s"window.i18n = ${I18n.messagesAsJson(lang)};")),
-        script(src := "/js/yonin-shogi.js"),
+        script(src := Layout.asset("/js/yonin-shogi.js")),
         script(raw(initScript))
       )
     )
@@ -547,10 +630,10 @@ object YoninShogiRoutes extends cask.Routes {
                   ),
                   // Finish actions (shown on last step)
                   div(id := "yt-finish", cls := "mt-3 d-flex gap-2 flex-wrap", style := "display:none;")(
-                    a(cls := "btn btn-warning", href := "/yonin-shogi/solo?bots=3")(
+                    a(cls := "btn btn-warning", href := "/solo?bots=3")(
                       i(cls := "bi bi-robot me-1"), I18n.t("yonin.tut.playBots")
                     ),
-                    a(cls := "btn btn-outline-warning", href := "/yonin-shogi")(
+                    a(cls := "btn btn-outline-warning", href := "/")(
                       i(cls := "bi bi-people-fill me-1"), I18n.t("yonin.tut.createGame")
                     )
                   )
@@ -562,8 +645,8 @@ object YoninShogiRoutes extends cask.Routes {
 
         script(src := "https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"),
         script(raw(s"window.i18n = ${I18n.messagesAsJson(lang)};")),
-        script(src := "/js/yonin-shogi.js"),
-        script(src := "/js/yonin-tutorial.js"),
+        script(src := Layout.asset("/js/yonin-shogi.js")),
+        script(src := Layout.asset("/js/yonin-tutorial.js")),
         script(raw("YoninTutorial.init();"))
       )
     )

@@ -318,6 +318,8 @@ let game = {
   local: false,        // solo-vs-bots mode (runs entirely client-side)
   botSeats: [],        // seats controlled by the computer
   botTimer: null,      // pending bot-move timeout
+  boardRotation: 0,    // quarter-turns the board view is rotated clockwise (0-3)
+  showCp: false,       // show the bot's centipawn evaluation of each move it plays
 };
 
 function findPlayer(id) {
@@ -325,7 +327,7 @@ function findPlayer(id) {
 }
 
 // ── Multiplayer API ───────────────────────────────────────
-const API = '/yonin-shogi/api';
+const API = '/api';
 
 async function apiCall(method, path, body) {
   const opts = { method, headers: { 'Content-Type': 'application/json' } };
@@ -337,22 +339,40 @@ async function apiCall(method, path, body) {
 async function createRoom() {
   const data = await apiCall('POST', '/create');
   if (data.roomId) {
-    window.location.href = '/yonin-shogi/game/' + data.roomId;
+    window.location.href = '/game/' + data.roomId;
   }
 }
 
+// Take a seat. If we already hold a seat this becomes a "change seat": we claim
+// the new seat first, then release the old one so a failed claim never strands us.
 async function joinSeat(seat) {
-  if (game.myPlayer >= 0) return;
-  const name = document.getElementById('ys-player-name')?.value?.trim() || 'Player';
+  const prevSeat = game.myPlayer;
+  if (prevSeat === seat) return;
+  const name = document.getElementById('ys-player-name')?.value?.trim()
+    || localStorage.getItem('ys_name_' + game.roomId) || 'Player';
   const data = await apiCall('POST', '/join/' + game.roomId, { seat, name });
   if (data.success) {
+    if (prevSeat >= 0 && prevSeat !== seat) {
+      await apiCall('POST', '/leave/' + game.roomId, { seat: prevSeat });
+    }
     game.myPlayer = seat;
+    orientToSeat(seat);
     localStorage.setItem('ys_seat_' + game.roomId, seat);
     localStorage.setItem('ys_name_' + game.roomId, name);
     renderAll();
   } else {
     alert(data.error || 'Could not join');
   }
+}
+
+// Give up our seat and return to spectating.
+async function leaveSeat() {
+  if (game.myPlayer < 0) return;
+  const seat = game.myPlayer;
+  game.myPlayer = -1;
+  localStorage.removeItem('ys_seat_' + game.roomId);
+  await apiCall('POST', '/leave/' + game.roomId, { seat });
+  renderAll();
 }
 
 async function startGame() {
@@ -393,34 +413,10 @@ function iAmBotRunner() {
 }
 
 function scheduleOnlineBotMove() {
+  // Online bot seats are now driven authoritatively by the server (it computes
+  // and relays their moves), so the client no longer runs them. Solo bots are
+  // still handled locally by scheduleBotMove().
   if (game.botTimer) { clearTimeout(game.botTimer); game.botTimer = null; }
-  if (game.local || game.status !== 'playing' || !game.players) return;
-  const seat = game.currentPlayer;
-  if (!game.players[seat] || !game.players[seat].isBot) return;
-  if (!iAmBotRunner()) return;
-  const atMoveCount = game.moveHistory.length;
-  game.botTimer = setTimeout(() => runOnlineBotMove(seat, atMoveCount), 700);
-}
-
-async function runOnlineBotMove(seat, atMoveCount) {
-  game.botTimer = null;
-  if (game.local || game.status !== 'playing' || !game.players) return;
-  // Bail if the game state moved on while we were waiting.
-  if (game.moveHistory.length !== atMoveCount) return;
-  if (game.currentPlayer !== seat || !game.players[seat] || !game.players[seat].isBot) return;
-  if (!iAmBotRunner()) return;
-
-  const move = chooseBotMove(seat, game.players[seat].botLevel);
-  if (!move) {
-    // Bot has no legal move — tell the server to eliminate this seat.
-    await apiCall('POST', '/eliminate/' + game.roomId, { loser: seat });
-    pollState();
-    return;
-  }
-  await sendMove(move, true);
-  // Fetch the advanced state promptly so a following bot can act without waiting
-  // for the next poll tick.
-  setTimeout(pollState, 250);
 }
 
 async function pollState() {
@@ -610,9 +606,9 @@ function advanceTurn() {
   // Yonin rule: if the move leaves an opponent in check, that player takes the
   // next turn immediately (clockwise-first if several are checked); clockwise
   // play then resumes from there. Checkmated players are already eliminated, so
-  // they are skipped here. (Local/solo only — multiplayer turn order is driven
-  // by the server, which does not yet detect check.)
-  if (game.local && game.board) {
+  // they are skipped here. The server applies the same rule for online rooms;
+  // here it keeps the optimistic local view in sync until the next poll.
+  if (game.board) {
     for (let step = 1; step <= 4; step++) {
       const cand = (game.currentPlayer + step) % 4;
       if (game.players[cand].alive && isInCheck(game.board, cand)) {
@@ -662,7 +658,43 @@ function runBotMove() {
     scheduleBotMove();
     return;
   }
+  move.cp = botMoveCp(move);  // centipawn eval of the chosen move (for the CP toggle)
   commitMove(move);
+}
+
+// Material-only centipawn eval of a board from `player`'s view: own material
+// minus the strongest opponent's, ×100. Mirrors ShogiEngine.materialCp so solo
+// and online show the same numbers.
+function materialCp(board, player) {
+  const mat = (pl) => {
+    let s = 0;
+    for (let r = 0; r < 9; r++)
+      for (let c = 0; c < 9; c++) {
+        const p = board[r][c];
+        if (p && p.owner === pl) s += PIECE_VALUE[p.type];
+      }
+    return s;
+  };
+  const mine = mat(player);
+  let best = 0;
+  for (let o = 0; o < 4; o++) if (o !== player) best = Math.max(best, mat(o));
+  return Math.round((mine - best) * 100);
+}
+
+// CP of a bot move: evaluate the position right after the move (pre-elimination).
+function botMoveCp(move) {
+  const b = cloneBoard(game.board);
+  if (move.type === 'move') {
+    const [fr, fc] = move.from, [tr, tc] = move.to;
+    b[tr][tc] = b[fr][fc]; b[fr][fc] = null;
+    if (move.promote && b[tr][tc] && CAN_PROMOTE[b[tr][tc].type] && !isPromoted(b[tr][tc].type)) {
+      b[tr][tc] = { ...b[tr][tc], type: PROMOTE[b[tr][tc].type] };
+    }
+  } else {
+    const [tr, tc] = move.to;
+    b[tr][tc] = { type: move.pieceType, owner: move.player };
+  }
+  return materialCp(b, move.player);
 }
 
 // Material values indexed by piece type (pawn,silver,gold,rook,king,tokin,+silver,dragon)
@@ -907,6 +939,28 @@ function renderAll() {
   renderMoveLog();
   renderLobby();
   renderSoloControls();
+  applyBoardRotation();
+}
+
+// ── Board rotation ────────────────────────────────────────
+// Rotating the whole board area (board + the four hands) is a pure visual
+// transform: clicks still hit the right cells, and each piece glyph — which
+// already faces its owner's direction — rotates along so the chosen player's
+// pieces end up pointing "up". Default orientation puts your own seat at the
+// bottom; rotation = (4 - seat) % 4 brings seat `seat` to the bottom.
+function orientToSeat(seat) {
+  const s = seat >= 0 ? seat : 0;
+  game.boardRotation = (4 - s) % 4;
+}
+
+function rotateBoard() {
+  game.boardRotation = (game.boardRotation + 1) % 4;
+  applyBoardRotation();
+}
+
+function applyBoardRotation() {
+  const area = document.querySelector('.ys-board-area');
+  if (area) area.style.transform = `rotate(${game.boardRotation * 90}deg)`;
 }
 
 function renderSoloControls() {
@@ -1037,8 +1091,8 @@ function renderPlayerCards() {
 
     const dot = `<span class="ys-player-dot"></span>`;
     const label = PLAYER_LABELS[i];
-    const name = p.name || (p.connected ? '...' : (window.i18n?.['yonin.empty'] || 'Empty'));
-    const me = i === game.myPlayer ? ' (You)' : '';
+    const name = p.name ? escapeHtml(p.name) : (p.connected ? '...' : (window.i18n?.['yonin.empty'] || 'Empty'));
+    const me = i === game.myPlayer ? ' (' + (window.i18n?.['yonin.you'] || 'You') + ')' : '';
     card.innerHTML = `${dot}<strong>${label}</strong>: ${name}${me}`;
     el.appendChild(card);
   }
@@ -1078,14 +1132,24 @@ function renderMoveLog() {
     const entry = document.createElement('div');
     entry.className = `move-entry player-${m.player}`;
     const label = PLAYER_LABELS[m.player];
+    let text;
     if (m.type === 'move') {
       const from = coordToLabel(m.from[0], m.from[1]);
       const to = coordToLabel(m.to[0], m.to[1]);
       const promo = m.promote ? '+' : '';
-      entry.textContent = `${i+1}. ${label}: ${from}→${to}${promo}`;
+      text = `${i+1}. ${label}: ${from}→${to}${promo}`;
     } else {
       const to = coordToLabel(m.to[0], m.to[1]);
-      entry.textContent = `${i+1}. ${label}: ${KANJI[m.pieceType]}*${to}`;
+      text = `${i+1}. ${label}: ${KANJI[m.pieceType]}*${to}`;
+    }
+    entry.textContent = text;
+    // Show the bot's centipawn evaluation of its own move when the toggle is on.
+    if (game.showCp && typeof m.cp === 'number') {
+      const cp = document.createElement('span');
+      cp.className = 'ys-cp';
+      const sign = m.cp > 0 ? '+' : '';
+      cp.textContent = ` (${sign}${m.cp}cp)`;
+      entry.appendChild(cp);
     }
     el.appendChild(entry);
   }
@@ -1117,6 +1181,13 @@ function botLabel(level) {
   return (window.i18n?.['yonin.bot'] || 'Bot') + ' (' + (window.i18n?.[key] || fallback) + ')';
 }
 
+// Escape user-supplied text (nicknames) before injecting via innerHTML.
+function escapeHtml(s) {
+  return String(s == null ? '' : s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
 function renderSeats() {
   const el = document.getElementById('ys-seats');
   if (!el || !game.players) return;
@@ -1140,22 +1211,33 @@ function renderSeats() {
       card.appendChild(rm);
     } else if (p.connected) {
       card.classList.add('taken');
-      if (i === game.myPlayer) card.classList.add('my-seat');
-      card.innerHTML = header + `<div class="mt-1">${p.name}${i === game.myPlayer ? ' (You)' : ''}</div>`;
+      const mine = i === game.myPlayer;
+      if (mine) card.classList.add('my-seat');
+      card.innerHTML = header + `<div class="mt-1 fw-semibold">${escapeHtml(p.name)}${mine ? ' (' + t('yonin.you', 'You') + ')' : ''}</div>`;
+      // Let me give up my own seat and go back to spectating.
+      if (mine) {
+        const leave = document.createElement('button');
+        leave.className = 'btn btn-sm btn-outline-secondary mt-2 w-100';
+        leave.innerHTML = `<i class="bi bi-box-arrow-left me-1"></i>${t('yonin.leaveSeat', 'Leave seat')}`;
+        leave.addEventListener('click', (e) => { e.stopPropagation(); leaveSeat(); });
+        card.appendChild(leave);
+      }
     } else {
       card.innerHTML = header;
-      // Take this seat yourself (only if you don't already have one).
       if (game.myPlayer < 0) {
+        // Spectator: take this seat.
         const join = document.createElement('button');
         join.className = 'btn btn-sm btn-outline-warning mt-2 w-100';
         join.textContent = t('yonin.clickToJoin', 'Click to join');
         join.addEventListener('click', () => joinSeat(i));
         card.appendChild(join);
       } else {
-        const empty = document.createElement('div');
-        empty.className = 'mt-1 text-muted';
-        empty.textContent = t('yonin.empty', 'Empty');
-        card.appendChild(empty);
+        // Already seated: move to this empty seat instead.
+        const move = document.createElement('button');
+        move.className = 'btn btn-sm btn-outline-warning mt-2 w-100';
+        move.innerHTML = `<i class="bi bi-arrow-left-right me-1"></i>${t('yonin.moveHere', 'Move here')}`;
+        move.addEventListener('click', () => joinSeat(i));
+        card.appendChild(move);
       }
       // ...or fill it with a bot of the chosen strength.
       const botRow = document.createElement('div');
@@ -1166,9 +1248,12 @@ function renderSeats() {
         .forEach(([v, lbl]) => {
           const o = document.createElement('option');
           o.value = v; o.textContent = lbl;
+          o.title = levelDesc(v);            // hover explains what the level does
           if (v === 'medium') o.selected = true;
           sel.appendChild(o);
         });
+      sel.title = levelDesc(sel.value);
+      sel.addEventListener('change', () => { sel.title = levelDesc(sel.value); });
       const addBtn = document.createElement('button');
       addBtn.className = 'btn btn-sm btn-outline-info text-nowrap';
       addBtn.innerHTML = `<i class="bi bi-robot me-1"></i>${t('yonin.addBot', 'Add bot')}`;
@@ -1210,8 +1295,26 @@ function initLobbyPage() {
   document.getElementById('ys-solo-btn')?.addEventListener('click', () => {
     const bots = document.getElementById('ys-bot-count')?.value || '3';
     const level = document.getElementById('ys-bot-level')?.value || 'medium';
-    window.location.href = '/yonin-shogi/solo?bots=' + bots + '&level=' + level;
+    window.location.href = '/solo?bots=' + bots + '&level=' + level;
   });
+  // Keep the difficulty tooltip in sync with the selected option.
+  const lvl = document.getElementById('ys-bot-level');
+  if (lvl) {
+    const sync = () => { lvl.title = lvl.options[lvl.selectedIndex]?.title || ''; };
+    lvl.addEventListener('change', sync);
+    sync();
+  }
+}
+
+// One-line description of each bot difficulty (used for hover tooltips).
+function levelDesc(level) {
+  const k = 'yonin.' + level + 'Desc';
+  const fallback = {
+    easy: 'Plays fast and makes random mistakes; may hang pieces.',
+    medium: 'Captures freely and avoids obvious blunders (1-move lookahead).',
+    hard: 'Weighs every move, seeks checks/mates and avoids hanging pieces.',
+  };
+  return (window.i18n && window.i18n[k]) || fallback[level] || '';
 }
 
 function initSoloGame(numBots, level) {
@@ -1247,9 +1350,23 @@ function initSoloGame(numBots, level) {
 
   game.status = 'playing';
   game.currentPlayer = 0;
+  setupCpToggle();
   clearSelection();
   renderAll();
   scheduleBotMove(); // in case seat 0 were ever a bot; harmless otherwise
+}
+
+// Wire the "show bot eval (CP)" checkbox and restore its saved state.
+function setupCpToggle() {
+  const box = document.getElementById('ys-cp-toggle');
+  if (!box) return;
+  game.showCp = localStorage.getItem('ys_show_cp') === '1';
+  box.checked = game.showCp;
+  box.addEventListener('change', () => {
+    game.showCp = box.checked;
+    localStorage.setItem('ys_show_cp', box.checked ? '1' : '0');
+    renderMoveLog();
+  });
 }
 
 function initGamePage(roomId) {
@@ -1262,9 +1379,17 @@ function initGamePage(roomId) {
   if (savedSeat !== null) {
     game.myPlayer = parseInt(savedSeat);
   }
+  // Orient the board so my own seat is at the bottom.
+  orientToSeat(game.myPlayer);
+
+  // Prefill the nickname field with the last name used in this room.
+  const savedName = localStorage.getItem('ys_name_' + roomId);
+  const nameInput = document.getElementById('ys-player-name');
+  if (nameInput && savedName) nameInput.value = savedName;
 
   document.getElementById('ys-copy-link')?.addEventListener('click', copyRoomLink);
   document.getElementById('ys-start-btn')?.addEventListener('click', startGame);
+  setupCpToggle();
 
   // Start polling
   pollState();
@@ -1275,7 +1400,7 @@ function initGamePage(roomId) {
 
 // Expose for HTML
 window.YoninShogi = {
-  initLobbyPage, initGamePage, initSoloGame, createRoom,
+  initLobbyPage, initGamePage, initSoloGame, createRoom, rotateBoard,
   // Test seam — pure internals exposed for unit tests; no effect on the app.
   _test: { chooseBotMove, iAmBotRunner, setState: (patch) => Object.assign(game, patch) },
 };
