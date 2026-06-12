@@ -10,6 +10,10 @@ import scalatags.Text.tags2.{title => titleTag}
  */
 object Layout {
 
+  /** App version, shown in the navbar and on the About page. Keep in sync with
+   *  the `version` in build.sbt. */
+  val appVersion: String = "1.0.0"
+
   /** Cache-busting token appended to local JS/CSS URLs. It changes on every
    *  server start, so after a rebuild browsers re-fetch the assets instead of
    *  serving a stale cached copy (StaticRoutes sets a 1h cache). */
@@ -37,7 +41,9 @@ object Layout {
       div(cls := "container-fluid")(
         a(cls := "navbar-brand fw-bold", href := "/")(
           i(cls := "bi bi-people-fill me-2", style := "color: #e8a317;"),
-          I18n.t("app.brand")
+          I18n.t("app.brand"),
+          span(cls := "badge bg-secondary ms-2 fw-normal align-middle",
+            style := "font-size: .6em;")(s"v$appVersion")
         ),
         button(cls := "navbar-toggler", tpe := "button",
           attr("data-bs-toggle") := "collapse", attr("data-bs-target") := "#ys-nav",

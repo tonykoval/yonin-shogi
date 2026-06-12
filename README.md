@@ -6,17 +6,30 @@ Standalone four-player [shogi](https://en.wikipedia.org/wiki/Shogi) (将棋) var
 
 Extracted from the [shogi-puzzler](https://github.com/tonykoval/shogi-puzzler) project into its own self-contained app.
 
+Current version: **1.0.0**.
+
+## Features
+
+- **Solo vs. bots** — 1–3 computer opponents at Easy / Medium / Hard.
+- **Online rooms** — share a link; empty seats can be filled with bots.
+- **Interactive tutorial** — learn the rules step by step.
+- **Checkmate modes** — choose what happens to an eliminated player's pieces:
+  *take their pieces* (classic), *pieces to your hand*, or *free-for-all*
+  (their pieces stay on the board for anyone to capture).
+- **Eval overlay** — per-player advantage bar, material points and check badges.
+- English and Slovak UI.
+
 ## How it works
 
 All game rules — move generation, check, checkmate, promotion, drops, the special
 4-player turn order and elimination logic — run **client-side** in
-`yonin-shogi.js`. The server is intentionally *not* rules-aware; it only:
+`yonin-shogi.js`, so **solo vs. bots** and the **tutorial** are fully offline in
+the browser.
 
-- serves the pages, and
-- relays moves between players in online rooms (in-memory, no database).
-
-That means **solo vs. bots** and the **tutorial** are fully offline in the browser;
-only online multiplayer touches the server.
+For **online rooms** the server keeps an authoritative copy of the same engine
+(`ShogiEngine.scala`) to validate turn order, resolve checkmate/elimination and
+drive bot seats; clients still replay the move list to render. Rooms are kept
+in memory only (no database).
 
 ## Tech stack
 
@@ -34,14 +47,15 @@ Then open:
 
 - `/` — lobby (solo / online / tutorial)
 - `/tutorial` — interactive rules tutorial
-- `/solo?bots=3` — play against 1–3 bots
+- `/solo?bots=3&level=medium&mode=inherit` — play against 1–3 bots
 - `/game/:roomId` — an online room
+- `/about` — about & credits
 
 ### Build a fat JAR
 
 ```bash
 sbt assembly
-java -jar target/scala-2.13/yonin-shogi-assembly-0.1.0-SNAPSHOT.jar
+java -jar target/scala-2.13/yonin-shogi-assembly-1.0.0.jar
 ```
 
 ### Configuration
