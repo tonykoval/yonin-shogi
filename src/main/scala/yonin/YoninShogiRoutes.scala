@@ -77,8 +77,10 @@ object YoninShogiRoutes extends cask.Routes {
   private def noCacheRedirect(location: String): cask.Response[String] =
     cask.Response("", statusCode = 302, headers = Seq("Location" -> location) ++ noCacheHeaders)
 
+  // Pages are never cached: they embed the per-build asset token (Layout.asset),
+  // so a stale cached page would keep pointing at old CSS/JS after a redeploy.
   private def htmlResponse(body: String, request: cask.Request): cask.Response[String] =
-    cask.Response(body, headers = Seq("Content-Type" -> "text/html; charset=utf-8"))
+    cask.Response(body, headers = Seq("Content-Type" -> "text/html; charset=utf-8") ++ noCacheHeaders)
 
   private def json(value: ujson.Value): cask.Response[ujson.Value] =
     cask.Response(value, headers = Seq("Content-Type" -> "application/json"))
